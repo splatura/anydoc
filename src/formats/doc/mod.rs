@@ -6,7 +6,10 @@
 //! (`sprmCFVanish`) and text marked for deletion by revision tracking
 //! (`sprmCFRMarkDel`) resolve through the same style-chain toggles as
 //! bold/italic/strike and are omitted from the model entirely, with no
-//! option to retain them.
+//! option to retain them. A footnote/endnote reference dropped with its
+//! hidden run is recorded too, so [`parse`] can prune the note body out of
+//! [`Document::notes`] afterward unless a visible reference to the same id
+//! survived assembly (`shared::notes::prune_hidden_notes`).
 
 mod lists;
 mod sprm;
@@ -28,7 +31,7 @@ use crate::shared::list::MarkerKind;
 use crate::shared::list::{ListEntry, ListKey, flush_list};
 use lists::{LEVELS, ListDef, Lists};
 use sprm::{Chp, PapDelta, Tap, apply_chpx, apply_pap_sprms, chpx_istd};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use stsh::Stylesheet;
 
@@ -117,6 +120,8 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         counters: std::cell::RefCell::new(Counters::default()),
         data,
         assets: std::cell::RefCell::new(AssetSink::new()),
+        dropped_notes: std::cell::RefCell::new(HashSet::new()),
+        visible_notes: std::cell::RefCell::new(HashSet::new()),
     };
     let blocks = assembler.build_blocks(0, main_end)?;
     let mut notes = Vec::new();
@@ -128,6 +133,11 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         }
         notes.push(Note { id, kind, blocks: assembler.build_blocks(lo, hi)? });
     }
+    crate::shared::notes::prune_hidden_notes(
+        &mut notes,
+        &assembler.dropped_notes.borrow(),
+        &assembler.visible_notes.borrow(),
+    );
     let assets = std::mem::take(&mut assembler.assets.borrow_mut().assets);
     Ok(Document { blocks, notes, assets })
 }
@@ -607,6 +617,14 @@ struct Assembler {
     /// The Data stream, for `sprmCPicLocation` picture payloads.
     data: Vec<u8>,
     assets: std::cell::RefCell<AssetSink>,
+    /// Ids of `note_refs` entries walked while hidden (`sprmCFVanish`), across
+    /// every range `build_blocks` assembles (the main body and every note
+    /// body, since a note can itself reference another note). Paired with
+    /// `visible_notes` after assembly to prune a note whose only reference
+    /// was hidden, via `shared::notes::prune_hidden_notes`.
+    dropped_notes: std::cell::RefCell<HashSet<String>>,
+    /// Ids of `note_refs` entries walked while not hidden, document-wide.
+    visible_notes: std::cell::RefCell<HashSet<String>>,
 }
 
 /// A paragraph's resolved properties: the style chain's contribution merged
@@ -715,9 +733,14 @@ impl Assembler {
             let fc = self.text.fcs[i];
             if let Some(id) = self.note_refs.get(&i) {
                 // A hidden run's footnote/endnote reference is dropped with
-                // it, the same as its text.
+                // it, the same as its text; its id is recorded either way so
+                // `parse` can prune the note body when no visible reference
+                // to it survives assembly.
                 let (_, hidden) = self.char_style(fc, i);
-                if !hidden {
+                if hidden {
+                    self.dropped_notes.borrow_mut().insert(id.clone());
+                } else {
+                    self.visible_notes.borrow_mut().insert(id.clone());
                     para.push_inline(Inline::NoteRef(id.clone()));
                 }
                 i += 1;
@@ -1090,7 +1113,11 @@ mod tests {
     // behaviour added alongside this comment has no end-to-end .doc test
     // here; it is covered at the `apply_chpx`/`prm0_grpprl` unit level in
     // `sprm.rs` and above, which exercise the exact toggle-resolution and
-    // Prm0-decoding logic the end-to-end path depends on.
+    // Prm0-decoding logic the end-to-end path depends on. Pruning a note
+    // whose only reference was hidden is the same story: `dropped_notes`
+    // and `visible_notes` above are populated straight from `char_style`'s
+    // resolved `hidden` bit, and the pruning itself is `prune_hidden_notes`
+    // in `shared::notes`, unit-tested there against a hand-built `Document`.
 
     fn list(lsid: u32) -> ListDef {
         let mut levels: [LevelDef; LEVELS] = std::array::from_fn(|_| LevelDef::default());

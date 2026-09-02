@@ -16,6 +16,7 @@ pub mod html;
 pub mod list;
 pub mod math;
 pub mod mc;
+pub mod notes;
 pub mod numbering;
 pub mod officeart;
 pub mod text;
