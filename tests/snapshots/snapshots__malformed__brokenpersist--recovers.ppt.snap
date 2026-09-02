@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 69
 expression: output
 ---
 Deck Title Slide
@@ -24,6 +25,10 @@ Grouped shapes below.
 
 Inside a group shape.
 
+> **Speaker notes**
+>
 > Speaker note for the intro slide.
 
+> **Speaker notes**
+>
 > Second slide notes mention the table.

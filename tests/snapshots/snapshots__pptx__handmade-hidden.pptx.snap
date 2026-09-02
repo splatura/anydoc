@@ -3,10 +3,10 @@ source: tests/snapshots.rs
 assertion_line: 69
 expression: output
 ---
-First slide text
-
-Second slide text
+KEEP-SLIDE-1
 
 > **Speaker notes**
 >
-> Notes for the second slide
+> KEEP-NOTE
+
+KEEP-SHAPE

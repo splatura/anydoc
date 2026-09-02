@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 69
 expression: output
 ---
 The roots are $x=\frac{-b\pm\sqrt{b^{2}-4ac}}{2a}$ for any a.
@@ -9,7 +10,7 @@ $$
 $$
 
 $$
-\text{where }-1<x
+\text{where }-1<{}x
 $$
 
 A price of $5 or $6 is not math.

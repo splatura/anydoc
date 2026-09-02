@@ -1,0 +1,18 @@
+---
+source: tests/snapshots.rs
+assertion_line: 69
+expression: output
+---
+# Hidden Book
+
+# Hidden Content Probe
+
+KEEP-VISIBLE paragraph.
+
+KEEP-VIS: KEEP-OP: KEEP-FS:
+
+Links: js data [ok](https://example.invalid/) proto-relative.
+
+remote-alt data-alt
+
+$<{}script>alert(2)<{}/script>$

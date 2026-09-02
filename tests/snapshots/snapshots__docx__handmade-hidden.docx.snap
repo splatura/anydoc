@@ -1,0 +1,24 @@
+---
+source: tests/snapshots.rs
+assertion_line: 69
+expression: output
+---
+KEEP-VISIBLE paragraph.
+
+KEEP-PARAMARK-VANISH
+
+KEEP-STYLE-OVERRIDE-RUN
+
+KEEP-STYLE-OVERRIDE-FALSE
+
+KEEP-BEFORE  KEEP-AFTER.
+
+js-link
+
+[ok-link](https://example.invalid/ok)
+
+remote-image-alt
+
+$<{}script>alert(1)<{}/script>$
+
+$a<{}b$

@@ -1,0 +1,20 @@
+---
+source: tests/snapshots.rs
+assertion_line: 69
+expression: output
+---
+KEEP-VISIBLE text.
+
+KEEP-AFTER-V-GROUP.
+
+KEEP-AFTER-TOGGLE.
+
+KEEP-V0-INSIDE-GROUP KEEP-AFTER.
+
+KEEP-AFTER-DELETED.
+
+KEEP-REVISED text
+
+js-link
+
+[ok-link](https://example.invalid/ok)
