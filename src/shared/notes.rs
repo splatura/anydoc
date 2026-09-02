@@ -20,6 +20,15 @@ use std::collections::HashSet;
 /// its id is in `dropped` and never in `visible`: a note referenced both
 /// ways, or not referenced at all, is left untouched - the latter matches
 /// the existing behaviour of rendering unreferenced notes at the end.
+///
+/// Known limitation: this is a single pass, not a fixed point. A note kept
+/// only because a *pruned* note's own body visibly referenced it (a note
+/// referencing another note, which Word's UI does not itself offer, but the
+/// parsers support) survives as an unreferenced trailing note instead of
+/// being pruned in turn. Closing that would mean walking reachability from
+/// the document body outward rather than a flat seen-anywhere/seen-hidden
+/// pair of id sets, which is more machinery than this narrow leak has
+/// earned; revisit if nested note references turn out to matter in practice.
 pub fn prune_hidden_notes(
     notes: &mut Vec<Note>,
     dropped: &HashSet<String>,
@@ -69,5 +78,20 @@ mod tests {
         let mut notes = vec![note("fn1")];
         prune_hidden_notes(&mut notes, &HashSet::new(), &HashSet::new());
         assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn a_note_reachable_only_through_a_pruned_note_survives_as_a_known_limitation() {
+        // fn1 is referenced only from hidden content (pruned); fn1's own
+        // body visibly references fn2, so fn2 is in `visible` even though
+        // its only referrer is gone. This single pass has no way to tell
+        // that apart from a genuinely independent visible reference, so
+        // fn2 survives - see the "known limitation" note on
+        // `prune_hidden_notes` above. Pinned here so a future fixed-point
+        // fix updates this test deliberately rather than by surprise.
+        let mut notes = vec![note("fn1"), note("fn2")];
+        prune_hidden_notes(&mut notes, &set(&["fn1"]), &set(&["fn2"]));
+        let ids: Vec<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["fn2"]);
     }
 }

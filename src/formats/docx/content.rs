@@ -1,11 +1,16 @@
 //! Block and inline walking for WordprocessingML parts.
 //!
 //! Hidden content never contributes a *resolved reference* either: a
-//! hyperlink whose label is empty only because hidden runs were dropped
-//! keeps neither text nor its target (an empty label the source itself
-//! wrote still shows the target, matching Word), and a footnote/endnote
-//! reference dropped with its hidden run is recorded so `docx::mod` can
-//! prune the note body unless a visible reference to the same id survives.
+//! hyperlink whose rendered label is empty only because hidden runs (or a
+//! tracked deletion, `w:del`/`w:moveFrom`) were dropped keeps neither text
+//! nor its target - any surviving non-hidden content (a bookmark, bare
+//! whitespace) is still kept as plain inlines so it is not lost along with
+//! the link (an empty label the source itself wrote still shows the
+//! target, matching Word). `InlineWalker::dropped_hidden` tracks this and
+//! bubbles up through nested hyperlinks/fldSimple so the check sees a drop
+//! at any depth. A footnote/endnote reference dropped with its hidden run
+//! or tracked deletion is recorded so `docx::mod` can prune the note body
+//! unless a visible reference to the same id survives.
 
 use crate::error::ConvertError;
 use crate::formats::docx::numbering::{Counters, Numbering};
@@ -443,17 +448,29 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                     let target = self.hyperlink_link_target(child);
                     let mut inner = InlineWalker::new(self.ctx, self.base, self.base_hidden);
                     inner.walk(child)?;
+                    // Bubble up regardless of nesting depth: a hyperlink (or
+                    // fldSimple) nested inside this one drops itself but
+                    // reports the drop only on its own fresh walker, so the
+                    // flag must propagate outward through every level for
+                    // the emptiness check below to see it.
                     let label_hidden = inner.dropped_hidden;
+                    self.dropped_hidden |= label_hidden;
                     let (content, attachments) = split_pieces(inner.finish());
                     if let Some(target) = target {
-                        if content.is_empty() && label_hidden {
-                            // The label is empty *because* hidden content was
-                            // dropped, not because the source wrote no runs:
-                            // Word shows nothing for this link, so neither
-                            // text nor a resolvable URL survives. A genuinely
+                        if label_hidden && inlines_are_empty(&content) {
+                            // The rendered label is empty *because* hidden
+                            // content was dropped, not because the source
+                            // wrote no runs: Word shows nothing for this
+                            // link, so neither text nor a resolvable URL
+                            // survives. Non-hidden leftovers (a bookmark, a
+                            // bare space) are kept as plain content so they
+                            // are not lost along with the link. A genuinely
                             // empty label (no hidden content involved) still
                             // keeps its target below - the renderer shows the
                             // URL as the link text, matching Word.
+                            for inline in content {
+                                self.push(inline);
+                            }
                         } else {
                             self.push(Inline::Link { content, target });
                         }
@@ -468,6 +485,7 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                     let instr = child.attr(ns::W, "instr").unwrap_or("").to_string();
                     let mut inner = InlineWalker::new(self.ctx, self.base, self.base_hidden);
                     inner.walk(child)?;
+                    self.dropped_hidden |= inner.dropped_hidden;
                     let (content, attachments) = split_pieces(inner.finish());
                     self.push_field_result(&instr, content);
                     self.push_blocks(attachments);
@@ -487,6 +505,19 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                 // `moveTo` is moved-in text — part of the final document;
                 // `customXml` wraps ordinary run content.
                 "smartTag" | "ins" | "bdo" | "dir" | "moveTo" | "customXml" => self.walk(child)?,
+                // `del`/`moveFrom` are tracked deletions (the text moved
+                // away from, for `moveFrom`): dropped like hidden runs, not
+                // walked for content, but their field structure and any
+                // note reference still need recording so a hyperlink whose
+                // whole label sits inside one drops its target too, and a
+                // footnote/endnote referenced only from inside one is
+                // pruned the same way a hidden reference is.
+                "del" | "moveFrom" => {
+                    self.dropped_hidden = true;
+                    for run in child.descendants(ns::W, "r") {
+                        self.walk_run_structure(run);
+                    }
+                }
                 _ => {}
             }
         }
@@ -535,13 +566,30 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
             // path walks 0x13/0x14/0x15 regardless of hidden for the same
             // reason, so this keeps the two frontends consistent.
             self.dropped_hidden = true;
-            for child in run.child_elems() {
-                self.handle_field_marker(child);
-                self.record_hidden_note_ref(child);
-            }
+            self.walk_run_structure(run);
             return Ok(());
         }
         self.walk_run_content(run, style)
+    }
+
+    /// Walk a run (or a tracked-deletion's runs) for field structure and
+    /// note references only, without emitting any visible content -
+    /// shared by the hidden branch of [`Self::walk_run`] and the
+    /// `w:del`/`w:moveFrom` arm of [`Self::walk`]. Mirrors
+    /// [`Self::walk_run_content`]'s `mc:AlternateContent` resolution so a
+    /// `w:footnoteReference` or `w:fldChar` reached only through an
+    /// AlternateContent branch is still recorded.
+    fn walk_run_structure(&mut self, elem: &Element) {
+        for child in elem.child_elems() {
+            if child.is(ns::MC, "AlternateContent") {
+                if let Some(branch) = self.ctx.alternate_branch(child) {
+                    self.walk_run_structure(branch);
+                }
+                continue;
+            }
+            self.handle_field_marker(child);
+            self.record_hidden_note_ref(child);
+        }
     }
 
     /// Record a footnote/endnote reference dropped along with the hidden run
