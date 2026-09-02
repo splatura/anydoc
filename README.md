@@ -142,7 +142,7 @@ anydoc reads text-based PDFs locally but does no OCR, so a PDF with scanned or i
 | Node   | `toMarkdown('scan.pdf', { ocr: 'hosted' })`    | `apiKey`                      |
 | Python | `anydoc.to_markdown("scan.pdf", ocr="hosted")` | `api_key`                     |
 
-Only documents that need OCR leave the machine, and the whole document goes, since Parse has no page selection. If Parse cannot convert it, Node rejects with `code: 'hosted'` and Python raises `HostedError`. `--api-url`, `apiUrl` and `api_url`, else `FIRECRAWL_API_URL`, point at another Parse deployment. The Rust crate has no `ocr` option and never makes network calls.
+Only documents that need OCR leave the machine, and the whole document goes, since Parse has no page selection. The file's basename is sent along with the bytes. If Parse cannot convert it, Node rejects with `code: 'hosted'` and Python raises `HostedError`. `--api-url`, `apiUrl` and `api_url`, else `FIRECRAWL_API_URL`, point at another Parse deployment. The Rust crate has no `ocr` option and never makes network calls.
 
 ## Features
 
@@ -273,6 +273,16 @@ document bytes
 
 Because every format funnels through the same document model and serializer, output quirks get fixed once. A table-escaping fix for docx is automatically a table-escaping fix for rtf, odt, and everything else.
 
+## What is left out
+
+- **Author-hidden content is omitted.** Word hidden ("vanish") text and hidden revision-deleted text in `.doc`/`.docx`/`.rtf`, hidden slides and hidden shapes in presentations, EPUB text styled `display:none` / `visibility:hidden` / `opacity:0` / `font-size:0` or carrying the `hidden` or `aria-hidden` attributes, ODF `text:display` none and collapsed table rows, hidden rows/columns/sheets in spreadsheets (already the case), and tracked deletions and comments (already the case) are all dropped. White-on-white text and off-page positioning are not detected.
+- **Speaker notes are kept**, quoted under a "Speaker notes" label.
+- **Link destinations are kept only for `http`, `https`, `mailto`, `tel`, `ftp`, and `ftps`.** Other schemes (`javascript:`, `data:`, `file:`, UNC paths) render as their label text.
+- **Images never carry a URL in the Markdown.** Embedded and linked images render as their alt text. The bytes of embedded images are available through `to_document`.
+- **Math is emitted as TeX between `$` delimiters**, with any `<` that could start an HTML tag neutralized.
+
+The output is still document content; treat it as untrusted when feeding it to an LLM.
+
 ## Development
 
 ```bash
@@ -284,11 +294,12 @@ wasm-pack build wasm --release --target web --scope firecrawl && node --test was
 
 A committed fixture corpus under `tests/fixtures/` is snapshot-tested, `tests/robustness.rs` mutation-tests every fixture, and `fuzz/` carries cargo-fuzz targets per format. The speed and quality benchmark lives in [`bench/`](bench/README.md).
 
-Releases are tagged `v<version>`, which publishes the crate, the npm package, and the PyPI wheels from [`.github/workflows/release.yml`](.github/workflows/release.yml). The version lives in three places, bumped together for a release:
+Releases are tagged `v<version>`, which publishes the crate, the npm package, and the PyPI wheels from [`.github/workflows/release.yml`](.github/workflows/release.yml). The version lives in four places, bumped together for a release:
 
 - [`Cargo.toml`](Cargo.toml): the crate
 - [`node/package.json`](node/package.json): the npm package
 - [`python/Cargo.toml`](python/Cargo.toml): the wheel (`python/pyproject.toml` reads it)
+- [`skills/convert-documents-to-markdown/SKILL.md`](skills/convert-documents-to-markdown/SKILL.md): the `@firecrawl/anydoc@<version>` pin in every `npx` example
 
 ## License
 
