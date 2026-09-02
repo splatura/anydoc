@@ -68,7 +68,14 @@
 //! in full rather than falling back to its URL as link text the way a
 //! genuinely empty `<a>` in the source still does - otherwise
 //! `<a href="..."><span hidden>label</span></a>` would render its href as
-//! visible prose. See the `"a"` arm of [`Builder::walk_inline`] and
+//! visible prose (any anchor target left in the label, e.g. from a nested
+//! `<span id>`, is kept - only the link and its href are dropped). This
+//! also reaches through nested `<a>` elements (the XML parser nests them
+//! freely, and EPUB XHTML does contain e.g. a href-less `<a id="...">`
+//! wrapping a hidden inner label): a drop inside an inner anchor's label
+//! still counts as a drop inside an enclosing anchor's label, even though
+//! the inner anchor's own save/restore already consumed the flag to decide
+//! its own fate. See the `"a"` arm of [`Builder::walk_inline`] and
 //! [`Builder::dropped_hidden`].
 
 use crate::error::ConvertError;
@@ -536,13 +543,18 @@ struct Builder<'e> {
     start_boundary: bool,
     /// Set whenever [`Builder::walk_elem`] or [`Builder::push_text`] drops
     /// content because it was author-hidden (as opposed to never having
-    /// been there at all) - shared across every sub-[`Builder`] spawned by
+    /// been there at all), and also when [`Builder::walk_elem`]'s
+    /// `"script"`/`"style"`/`"head"`/`"template"`/`"noscript"` arm drops a
+    /// non-rendering element - a browser shows nothing for those either, so
+    /// they are as much a disguise for an enclosing `<a>`'s href as CSS or
+    /// attribute hiding is. Shared across every sub-[`Builder`] spawned by
     /// [`Builder::sub_blocks_at`] via the `Cell`, since a `<span hidden>`
     /// inside an `<a>`'s label walks through a fresh sub-builder rather than
-    /// `self`. Consulted (and scoped with a save/restore) only by the `"a"`
-    /// arm of [`Builder::walk_inline`]: an anchor emptied by dropping hidden
-    /// content must not fall back to showing its URL as label text the way
-    /// a source-empty `<a>` does.
+    /// `self`. Consulted (and scoped with a save/restore that still
+    /// propagates a drop back out, since `<a>` elements can nest) only by
+    /// the `"a"` arm of [`Builder::walk_inline`]: an anchor emptied by
+    /// dropping hidden content must not fall back to showing its URL as
+    /// label text the way a source-empty `<a>` does.
     dropped_hidden: &'e std::cell::Cell<bool>,
 }
 
@@ -862,7 +874,13 @@ impl Builder<'_> {
                     self.walk_children(elem, inherited)?;
                 }
             }
-            "script" | "style" | "head" | "template" | "noscript" => {}
+            // Non-rendering elements: a browser shows nothing for them, so a
+            // `<a>` label made of only these is as hidden a disguise for
+            // its href as CSS/attribute hiding is - see
+            // [`Builder::dropped_hidden`]'s doc comment.
+            "script" | "style" | "head" | "template" | "noscript" => {
+                self.dropped_hidden.set(true);
+            }
             _ => self.walk_inline(elem, inherited)?,
         }
         Ok(())
@@ -902,17 +920,25 @@ impl Builder<'_> {
             }
             "a" => {
                 let target = elem.attr_any("href").and_then(|href| self.ctx.link_target(href));
-                // Scoped to just this anchor's children: save/restore around
-                // the walk so a drop inside this label neither inherits an
-                // unrelated drop from before the `<a>` nor leaks out to an
-                // enclosing one.
+                // Scoped to just this anchor's children: reset to `false`
+                // before the walk so a drop inside this label does not
+                // inherit an unrelated drop from before the `<a>`. But a
+                // drop *is* propagated back out afterward (rather than
+                // simply restored to `outer_dropped_hidden`) - the XML
+                // parser nests `<a>` elements freely, and a hidden drop
+                // inside a nested `<a>`'s own label is still a drop inside
+                // this (enclosing) anchor's label, whether or not the inner
+                // anchor emptied itself over it. Without the propagation, an
+                // inner anchor's own save/restore would consume the flag
+                // before this outer arm ever saw it.
                 let outer_dropped_hidden = self.dropped_hidden.replace(false);
                 let content = self.inline_children_at(
                     elem,
                     inherited,
                     at_space_boundary(&self.inlines, self.start_boundary),
                 )?;
-                let label_dropped_hidden = self.dropped_hidden.replace(outer_dropped_hidden);
+                let label_dropped_hidden = self.dropped_hidden.get();
+                self.dropped_hidden.set(outer_dropped_hidden || label_dropped_hidden);
                 // A label left empty by dropping hidden content must not
                 // fall back to the URL as visible text - that would leak an
                 // attacker-controlled href the author tried to disguise
@@ -921,7 +947,12 @@ impl Builder<'_> {
                 // still shows the URL as its link text.
                 let leaked_by_hidden_label = label_dropped_hidden && inlines_are_empty(&content);
                 match target {
-                    Some(_) if leaked_by_hidden_label => {}
+                    // `content` holds nothing visible here (only anchors,
+                    // whitespace, or line breaks - that's what made
+                    // `inlines_are_empty` true) - keep it so any anchor
+                    // target inside the dropped label still survives, just
+                    // without the link (and its href) around it.
+                    Some(_) if leaked_by_hidden_label => self.inlines.extend(content),
                     Some(target) => self.inlines.push(Inline::Link { content, target }),
                     None => self.inlines.extend(content),
                 }
@@ -1856,6 +1887,83 @@ mod tests {
             r#"<body><p><a href="https://evil.example/X"><pre><span hidden="">x</span></pre></a></p></body>"#,
         );
         assert!(out.is_empty(), "hidden-pre-content label must not leak its URL: {out:?}");
+    }
+
+    #[test]
+    fn outer_anchor_wrapping_a_hidden_label_inner_anchor_drops_both_links() {
+        // LEAK A, nested case: a hidden drop inside a nested `<a>` is a drop
+        // inside the enclosing anchor's label too - the inner anchor
+        // dropping itself must not "use up" the flag before the outer
+        // anchor gets to see it.
+        let out = blocks(
+            r#"<body><p>
+                <a href="https://evil.example/OUTER"><a href="https://evil.example/INNER"><span hidden="">x</span></a></a>
+                <a href="https://good.example">kept</a>
+            </p></body>"#,
+        );
+        let Block::Paragraph(inlines) = &out[0] else { panic!("{out:?}") };
+        let links: Vec<&str> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Link { target: LinkTarget::External(u), .. } => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec!["https://good.example"], "{inlines:?}");
+    }
+
+    #[test]
+    fn outer_anchor_wrapping_a_hidden_label_href_less_inner_anchor_drops_the_link() {
+        // Same nested leak via a href-less inner `<a>` (the common
+        // `<a id="...">` named-anchor wrapper pattern).
+        let out = blocks(
+            r#"<body><p>
+                <a href="https://evil.example/OUTER"><a><span hidden="">x</span></a></a>
+                <a href="https://good.example">kept</a>
+            </p></body>"#,
+        );
+        let Block::Paragraph(inlines) = &out[0] else { panic!("{out:?}") };
+        let links: Vec<&str> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Link { target: LinkTarget::External(u), .. } => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec!["https://good.example"], "{inlines:?}");
+    }
+
+    #[test]
+    fn anchor_dropped_by_hidden_label_still_keeps_an_internal_anchor_target() {
+        // A dropped link's label may still carry an `Inline::Anchor` some
+        // other link targets (`inlines_are_empty` treats anchors as empty,
+        // so they don't stop the label from counting as leaked). Dropping
+        // the whole link must not also drop that anchor target.
+        let out = blocks(
+            r#"<body><p><a href="https://evil.example/X"><span hidden="">x</span><span id="keepme"></span></a></p></body>"#,
+        );
+        let Block::Paragraph(inlines) = &out[0] else { panic!("{out:?}") };
+        assert!(
+            !inlines.iter().any(|i| matches!(i, Inline::Link { .. })),
+            "the link itself must still be dropped: {inlines:?}"
+        );
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::Anchor(_))),
+            "the anchor target must survive: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_whose_only_child_is_a_non_rendering_element_drops_the_link() {
+        // A browser renders nothing for `<script>`/`<style>`/`<template>`/
+        // `<noscript>`/`<head>` content, so a label made of only such
+        // elements is "hidden" for the same disguised-href reason as CSS or
+        // attribute hiding, even though nothing here is author-hidden in
+        // the `hidden`/`display: none` sense.
+        let out = blocks(
+            r#"<body><p><a href="https://evil.example/X"><script>x</script></a></p></body>"#,
+        );
+        assert!(out.is_empty(), "non-rendering-child label must not leak its URL: {out:?}");
     }
 
     #[test]
