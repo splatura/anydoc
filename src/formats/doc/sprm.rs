@@ -76,9 +76,10 @@ pub fn chpx_pic_location(grpprl: &[u8]) -> Option<u32> {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Chp {
     pub style: Style,
-    /// `sprmCFVanish` (hidden text) or `sprmCFRMarkDel` (marked for
-    /// deletion by revision tracking): both are toggles that resolve
-    /// against the same style-chain base, the same as bold/italic/strike.
+    /// `sprmCFVanish`/`sprmCFSpecVanish`/`sprmCFWebHidden` (hidden text) or
+    /// `sprmCFRMarkDel` (marked for deletion by revision tracking): all are
+    /// toggles that resolve against the same style-chain base, the same as
+    /// bold/italic/strike.
     pub hidden: bool,
 }
 
@@ -103,9 +104,14 @@ pub fn apply_chpx(grpprl: &[u8], current: Chp, style_base: Chp) -> Chp {
                 chp.style.strike = v;
             }
         }
-        // sprmCFVanish / sprmCFRMarkDel: hidden text, or text marked for
-        // deletion by revision tracking - both hide the run the same way.
-        0x0818 | 0x0800 => {
+        // sprmCFVanish (0x083C, author-hidden text), sprmCFSpecVanish
+        // (0x0818, the hidden paragraph-mark/field-marker flag used by
+        // TOC and other generated fields), sprmCFWebHidden (0x0811, "hide
+        // when shown as a web page" - parity with the DOCX w:webHidden
+        // handling), and sprmCFRMarkDel (0x0800, text marked for deletion
+        // by revision tracking): all four are toggles that hide the run
+        // the same way.
+        0x083C | 0x0818 | 0x0811 | 0x0800 => {
             if let Some(v) = toggle(operand, style_base.hidden) {
                 chp.hidden = v;
             }
@@ -275,7 +281,15 @@ mod hidden_tests {
     use super::*;
 
     fn vanish_grpprl(operand: u8) -> Vec<u8> {
-        vec![0x18, 0x08, operand] // sprmCFVanish
+        vec![0x3C, 0x08, operand] // sprmCFVanish
+    }
+
+    fn spec_vanish_grpprl(operand: u8) -> Vec<u8> {
+        vec![0x18, 0x08, operand] // sprmCFSpecVanish
+    }
+
+    fn web_hidden_grpprl(operand: u8) -> Vec<u8> {
+        vec![0x11, 0x08, operand] // sprmCFWebHidden
     }
 
     fn rmark_del_grpprl(operand: u8) -> Vec<u8> {
@@ -297,6 +311,23 @@ mod hidden_tests {
         assert!(apply_chpx(&vanish_grpprl(0x80), plain_base, hidden_base).hidden);
         assert!(!apply_chpx(&vanish_grpprl(0x81), plain_base, hidden_base).hidden);
         assert!(apply_chpx(&vanish_grpprl(0x81), plain_base, plain_base).hidden);
+    }
+
+    #[test]
+    fn sprm_cf_spec_vanish_hides_the_same_way_as_vanish() {
+        // sprmCFSpecVanish (0x0818) is the hidden paragraph-mark/field
+        // flag used by TOC and other generated fields; it must keep hiding
+        // even though 0x0818 is not sprmCFVanish's real opcode (0x083C).
+        let base = Chp::default();
+        assert!(apply_chpx(&spec_vanish_grpprl(1), base, base).hidden);
+        assert!(!apply_chpx(&spec_vanish_grpprl(0), Chp { hidden: true, ..base }, base).hidden);
+    }
+
+    #[test]
+    fn sprm_cf_web_hidden_hides_the_same_way_as_vanish() {
+        let base = Chp::default();
+        assert!(apply_chpx(&web_hidden_grpprl(1), base, base).hidden);
+        assert!(!apply_chpx(&web_hidden_grpprl(0), Chp { hidden: true, ..base }, base).hidden);
     }
 
     #[test]

@@ -24,6 +24,15 @@ pub struct Toggles {
     /// `w:vanish` (ECMA-376 §17.7.3 toggle property). Unlike bold/italic/
     /// strike this never reaches [`Style`] - it is consulted separately so a
     /// hidden style can hide the runs that use it.
+    ///
+    /// Deliberately vanish-only: `w:webHidden` is not an ECMA-376 toggle
+    /// property (it has no defined behavior when repeated down a `basedOn`
+    /// chain), so folding it into this XOR parity the way `strike`/
+    /// `dstrike` are combined would make two `<w:webHidden/>` specifications
+    /// along the chain cancel each other back to visible - an absolute
+    /// property masquerading as a toggle. Direct formatting has no such
+    /// problem (`rpr_delta` treats it as absolute, ORed with vanish), so
+    /// only the style cascade omits it.
     pub hidden: bool,
 }
 
@@ -86,9 +95,9 @@ impl<'a> Styles<'a> {
             .find(ns::W, "docDefaults")
             .and_then(|d| d.find(ns::W, "rPrDefault"))
             .and_then(|d| d.find(ns::W, "rPr"));
-        let doc_defaults = default_rpr.map(|rpr| rpr_delta(rpr).resolve()).unwrap_or(Style::PLAIN);
-        let doc_defaults_hidden =
-            default_rpr.map(|rpr| rpr_delta(rpr).hidden.unwrap_or(false)).unwrap_or(false);
+        let default_delta = default_rpr.map(rpr_delta);
+        let doc_defaults = default_delta.map(|d| d.resolve()).unwrap_or(Style::PLAIN);
+        let doc_defaults_hidden = default_delta.and_then(|d| d.hidden).unwrap_or(false);
         Styles { chains, doc_defaults, doc_defaults_hidden }
     }
 

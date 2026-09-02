@@ -252,9 +252,13 @@ fn prm0_grpprl(prm: u16) -> Option<Vec<u8>> {
         0x0C => 0x260A, // sprmPIlvl
         0x18 => 0x2416, // sprmPFInTable
         0x19 => 0x2417, // sprmPFTtp
+        0x3F => 0x0800, // sprmCFRMarkDel
+        0x50 => 0x0811, // sprmCFWebHidden
+        0x51 => 0x0818, // sprmCFSpecVanish
         0x55 => 0x0835, // sprmCFBold
         0x56 => 0x0836, // sprmCFItalic
         0x57 => 0x0837, // sprmCFStrike
+        0x5C => 0x083C, // sprmCFVanish
         0x78 => 0x2640, // sprmPOutLvl
         _ => return None,
     };
@@ -1166,6 +1170,17 @@ mod tests {
         assert_eq!(prm0_grpprl(prm), Some(vec![0x16, 0x24, 0x01]));
         // isprm 0x05 (sprmPJc) is outside the converted model.
         assert_eq!(prm0_grpprl(0x05 << 1), None);
+    }
+
+    #[test]
+    fn prm0_decodes_hidden_and_deleted_toggles() {
+        // isprm 0x5C = sprmCFVanish (0x083C): the fast-save path must hide
+        // text the same way a full CHPX grpprl does.
+        let prm = (0x5Cu16 << 1) | (0x01 << 8);
+        assert_eq!(prm0_grpprl(prm), Some(vec![0x3C, 0x08, 0x01]));
+        // isprm 0x3F = sprmCFRMarkDel (0x0800).
+        let prm = (0x3Fu16 << 1) | (0x01 << 8);
+        assert_eq!(prm0_grpprl(prm), Some(vec![0x00, 0x08, 0x01]));
     }
 
     #[test]

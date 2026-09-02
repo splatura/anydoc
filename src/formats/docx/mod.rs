@@ -435,4 +435,99 @@ mod tests {
         };
         assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "kept");
     }
+
+    #[test]
+    fn paragraph_style_vanish_hides_runs_with_no_direct_rpr() {
+        // Hidden must also cascade from a *paragraph* style, not only a
+        // character style: a run with no rPr of its own still hides when
+        // its paragraph uses a w:pStyle carrying w:vanish.
+        let document = format!(
+            r#"<w:document {W}><w:body>
+            <w:p><w:pPr><w:pStyle w:val="HiddenPara"/></w:pPr>
+                <w:r><w:t>secret</w:t></w:r></w:p>
+            <w:p><w:r><w:t>kept</w:t></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="paragraph" w:styleId="HiddenPara">
+                <w:rPr><w:vanish/></w:rPr>
+            </w:style></w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert_eq!(doc.blocks.len(), 1, "hidden paragraph must not survive: {:?}", doc.blocks);
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "kept");
+    }
+
+    #[test]
+    fn doc_defaults_vanish_hides_runs_with_no_style_or_direct_rpr() {
+        // docDefaults' rPr is the base every toggle parity flips over; a
+        // vanish there hides a run that specifies no rPr at all.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert!(doc.blocks.is_empty(), "{:?}", doc.blocks);
+    }
+
+    #[test]
+    fn based_on_vanish_cancels_between_parent_and_child_style() {
+        // w:vanish is a toggle property: two true specifications along the
+        // basedOn chain cancel back to visible, the same parity rule as
+        // bold/italic/strike.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Child"/></w:rPr><w:t>visible</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Child">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph, hidden text cancelled back to visible: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
+    fn hidden_fld_char_separate_does_not_drop_the_visible_field_result() {
+        // A field's structural markers (w:fldChar/w:instrText) must still
+        // be walked even when the marker's own run is hidden: a hidden
+        // "separate" that never flips in_result would leave every visible
+        // result run discarded until "end".
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> HYPERLINK "https://example.com" </w:instrText></w:r>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>link text</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(text.contains("link text"), "{text:?}");
+    }
 }

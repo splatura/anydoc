@@ -493,9 +493,53 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
             // Author-hidden text (`w:vanish`/`w:webHidden`) is omitted along
             // with everything the run carries - text, breaks, drawings, and
             // footnote/endnote references - the same way Word hides them.
+            // The run's field markers (`w:fldChar`/`w:instrText`) are the
+            // exception: they are structural, not content, and a visible
+            // field result depends on them even when the marker itself
+            // sits in a hidden run (an author can hide the `separate`
+            // marker without hiding the result runs after it, or hide an
+            // `instrText` while leaving the field visible). The binary DOC
+            // path walks 0x13/0x14/0x15 regardless of hidden for the same
+            // reason, so this keeps the two frontends consistent.
+            for child in run.child_elems() {
+                self.handle_field_marker(child);
+            }
             return Ok(());
         }
         self.walk_run_content(run, style)
+    }
+
+    /// Handle a run child that is part of a field's structure
+    /// (`w:fldChar`/`w:instrText`), ignoring anything else. Shared between
+    /// [`Self::walk_run_content`] and the hidden-run path in
+    /// [`Self::walk_run`], which still needs field structure walked even
+    /// though it skips the run's visible content.
+    fn handle_field_marker(&mut self, child: &Element) {
+        if child.ns.as_deref().is_none_or(|n| n != ns::W) {
+            return;
+        }
+        match child.local.as_str() {
+            "fldChar" => match child.attr(ns::W, "fldCharType") {
+                Some("begin") => self.fields.push(FieldFrame::default()),
+                Some("separate") => {
+                    if let Some(f) = self.fields.last_mut() {
+                        f.in_result = true;
+                    }
+                }
+                Some("end") => {
+                    if let Some(FieldFrame { instr, inlines, .. }) = self.fields.pop() {
+                        self.push_field_result(&instr, inlines);
+                    }
+                }
+                _ => {}
+            },
+            "instrText" => {
+                if let Some(f) = self.fields.last_mut() {
+                    f.instr.push_str(&child.text());
+                }
+            }
+            _ => {}
+        }
     }
 
     fn walk_run_content(&mut self, run: &Element, style: Style) -> Result<(), ConvertError> {
@@ -538,25 +582,7 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                     }
                 }
                 "drawing" | "pict" | "object" => self.walk_drawing(child)?,
-                "fldChar" => match child.attr(ns::W, "fldCharType") {
-                    Some("begin") => self.fields.push(FieldFrame::default()),
-                    Some("separate") => {
-                        if let Some(f) = self.fields.last_mut() {
-                            f.in_result = true;
-                        }
-                    }
-                    Some("end") => {
-                        if let Some(FieldFrame { instr, inlines, .. }) = self.fields.pop() {
-                            self.push_field_result(&instr, inlines);
-                        }
-                    }
-                    _ => {}
-                },
-                "instrText" => {
-                    if let Some(f) = self.fields.last_mut() {
-                        f.instr.push_str(&child.text());
-                    }
-                }
+                "fldChar" | "instrText" => self.handle_field_marker(child),
                 _ => {}
             }
         }
