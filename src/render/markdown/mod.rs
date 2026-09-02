@@ -1,4 +1,13 @@
 //! GitHub-Flavored Markdown serializer for the document model.
+//!
+//! Three policies keep an attacker-authored document from reaching outside
+//! the rendered Markdown text: math source (inline and block) is guarded so
+//! it can never open an HTML tag, comment, or processing instruction; link
+//! destinations are allow-listed by URL scheme (and relative targets are
+//! checked against UNC/protocol-relative disguises), with disallowed
+//! destinations dropped in favor of the link's plain-text content; and image
+//! sources are never emitted at all, embedded or external, only their alt
+//! text.
 
 mod anchors;
 mod escape;
@@ -10,7 +19,7 @@ mod tests;
 
 use crate::model::{Block, Document, Inline, List, MarkerKind, Note, TableKind, inlines_are_empty};
 use anchors::{AnchorMap, resolve_anchors};
-use escape::{EscapeOpts, InlineContext, backtick_fence, escape_text};
+use escape::{EscapeOpts, InlineContext, backtick_fence, escape_text, guard_html_in_math};
 use inline::render_inlines;
 use std::collections::{HashMap, HashSet};
 
@@ -205,10 +214,13 @@ fn render_block(block: &Block, rc: &Ctx) -> Option<String> {
                 return None;
             }
             // A bare `$` is never valid inside math; escaped, it cannot
-            // close the block early.
-            let mut source = String::with_capacity(tex.len());
+            // close the block early. The HTML guard runs first so the `{}`
+            // it inserts can't itself be mistaken for math syntax needing
+            // escape.
+            let guarded = guard_html_in_math(tex);
+            let mut source = String::with_capacity(guarded.len());
             let mut backslashes = 0;
-            for c in tex.chars() {
+            for c in guarded.chars() {
                 if c == '$' && backslashes % 2 == 0 {
                     source.push('\\');
                 }

@@ -299,6 +299,80 @@ pub(crate) fn escape_url_as_text(url: &str, ctx: InlineContext) -> String {
     )
 }
 
+/// Schemes this renderer will still keep as a link destination.
+/// `javascript:`, `vbscript:`, `data:`, `file:` and unrecognized schemes can
+/// run script or read local files when a Markdown viewer resolves them, so
+/// only well-understood navigation schemes survive.
+const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto", "tel", "ftp", "ftps"];
+
+/// Whether `url`'s scheme (the text before its first `:`, compared ASCII
+/// case-insensitively) is one the renderer keeps as a link destination.
+/// A destination with no `:` at all has no scheme and is not kept.
+pub(crate) fn url_scheme_allowed(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => {
+            ALLOWED_URL_SCHEMES.iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        }
+        None => false,
+    }
+}
+
+/// Whether a scheme-less relative reference is actually confined to being
+/// relative. Frontends hand `href`/target values through untrimmed, so a
+/// leading space or control character (which browsers strip before
+/// resolving a URL, and which `is_absolute_uri` does not recognize as
+/// starting a scheme) is stripped first. What remains is rejected if it
+/// opens with two `/`/`\` characters in any combination — a UNC path
+/// (`\\server\share`), a protocol-relative URL (`//host/path`), or the
+/// `/\`/`\/` variants the WHATWG URL parser also treats as protocol-relative
+/// for special schemes — or if a `:` appears before the first `/`, `\`, `?`
+/// or `#`, which a genuine relative reference can never contain in its first
+/// segment and which otherwise lets a scheme-bearing target (e.g.
+/// `javascript:`) hide behind the leading whitespace that routed it here
+/// instead of through [`url_scheme_allowed`]. The same colon check also
+/// rejects Windows drive-letter paths (`C:\docs\a.doc`, `c:/docs/a.doc`) that
+/// [`crate::shared::uri::is_drive_path`] deliberately routes to
+/// `LinkTarget::Relative` rather than `External`; that is intentional, not a
+/// bug, since a bare `file:`-equivalent path is no safer than `file:` itself.
+pub(crate) fn relative_target_allowed(url: &str) -> bool {
+    let trimmed = url.trim_start_matches(|c: char| c <= ' ');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next();
+    let second = chars.next();
+    if matches!(first, Some('/' | '\\')) && matches!(second, Some('/' | '\\')) {
+        return false;
+    }
+    let has_colon_first_segment = match trimmed.find(['/', '\\', '?', '#']) {
+        Some(idx) => trimmed[..idx].contains(':'),
+        None => trimmed.contains(':'),
+    };
+    !has_colon_first_segment
+}
+
+/// Neutralizes HTML markup inside math source without changing its TeX
+/// meaning: after each `<` immediately followed by an ASCII letter, `/`, `!`
+/// or `?` (the shapes that open a tag, a closing tag, a comment, or a
+/// processing instruction) the empty TeX group `{}` is inserted, so
+/// `<script>` becomes `<{}script>`. `{}` is a no-op grouping in TeX and in
+/// KaTeX/MathJax, so the math still renders the same; a `<` followed by
+/// anything else (`a < b`, `x<=y`) is left alone.
+pub(crate) fn guard_html_in_math(tex: &str) -> String {
+    let mut out = String::with_capacity(tex.len());
+    let mut chars = tex.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '<'
+            && chars.peek().is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
+        {
+            out.push_str("{}");
+        }
+    }
+    out
+}
+
 /// Prepare a code span's text for a table cell, where a pipe is the only
 /// character between the fences that is still syntax.
 ///
@@ -330,4 +404,98 @@ pub(crate) fn escape_cell_code_span(text: &str) -> String {
 pub(crate) fn backtick_fence(text: &str, min: usize) -> String {
     let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     "`".repeat((longest_run + 1).max(min))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_schemes_kept_case_insensitively() {
+        assert!(url_scheme_allowed("https://example.com"));
+        assert!(url_scheme_allowed("HTTP://example.com"));
+        assert!(url_scheme_allowed("mailto:a@b.c"));
+        assert!(url_scheme_allowed("tel:+1-555-0100"));
+        assert!(url_scheme_allowed("ftp://example.com"));
+        assert!(url_scheme_allowed("ftps://example.com"));
+    }
+
+    #[test]
+    fn dangerous_or_unrecognized_schemes_rejected() {
+        assert!(!url_scheme_allowed("javascript:alert(1)"));
+        assert!(!url_scheme_allowed("JAVASCRIPT:alert(1)"));
+        assert!(!url_scheme_allowed("vbscript:msgbox(1)"));
+        assert!(!url_scheme_allowed("data:text/html,<script>1</script>"));
+        assert!(!url_scheme_allowed("file:///etc/passwd"));
+        assert!(!url_scheme_allowed("no-scheme-at-all"));
+    }
+
+    #[test]
+    fn unc_and_protocol_relative_targets_rejected() {
+        assert!(!relative_target_allowed(r"\\evil\share"));
+        assert!(!relative_target_allowed("//evil/x"));
+    }
+
+    #[test]
+    fn drive_letter_paths_rejected() {
+        // `is_drive_path` in src/shared/uri.rs routes these to
+        // `LinkTarget::Relative` on purpose; the colon-in-first-segment rule
+        // here rejects them for the same reason `file:` is disallowed, not
+        // by accident.
+        assert!(!relative_target_allowed(r"C:\docs\a.doc"));
+        assert!(!relative_target_allowed("c:/docs/a.doc"));
+    }
+
+    #[test]
+    fn whitespace_only_target_rejected() {
+        assert!(!relative_target_allowed("   "));
+    }
+
+    #[test]
+    fn ordinary_relative_targets_allowed() {
+        assert!(relative_target_allowed("../x.html"));
+        assert!(relative_target_allowed("chapter2.xhtml#top"));
+        assert!(relative_target_allowed("a/b:c"));
+    }
+
+    #[test]
+    fn whitespace_prefixed_scheme_bearing_targets_rejected() {
+        // A leading space keeps `is_absolute_uri` from classifying these as
+        // External, but they are still scheme-bearing and must not slip
+        // through as a bare relative reference.
+        assert!(!relative_target_allowed(" javascript:alert(1)"));
+        assert!(!relative_target_allowed(" //evil/x"));
+    }
+
+    #[test]
+    fn mixed_slash_backslash_protocol_relative_targets_rejected() {
+        // The WHATWG URL parser treats `\` as `/` for special schemes, so
+        // these resolve as protocol-relative just like `//evil/x`.
+        assert!(!relative_target_allowed(r"/\evil/x"));
+        assert!(!relative_target_allowed(r"\/evil/x"));
+    }
+
+    #[test]
+    fn math_guard_neutralizes_tag_like_shapes() {
+        assert_eq!(
+            guard_html_in_math("<script>alert(1)</script>"),
+            "<{}script>alert(1)<{}/script>"
+        );
+        assert_eq!(guard_html_in_math("<!-- c -->"), "<{}!-- c -->");
+        assert_eq!(guard_html_in_math("<?xml?>"), "<{}?xml?>");
+    }
+
+    #[test]
+    fn math_guard_leaves_comparisons_alone() {
+        assert_eq!(guard_html_in_math("a < b"), "a < b");
+        assert_eq!(guard_html_in_math("x<=y"), "x<=y");
+    }
+
+    #[test]
+    fn math_guard_still_guards_a_bare_letter_after_lt() {
+        // Documented as accepted: TeX has no syntax where `<letter>` means
+        // anything but comparison-then-identifier, so the guard cannot tell
+        // this apart from a tag and always inserts the group.
+        assert_eq!(guard_html_in_math("a<b"), "a<{}b");
+    }
 }
