@@ -331,6 +331,8 @@ fn allowed_url_schemes_keep_the_link() {
         ("HTTP://e.test", "[go](HTTP://e.test)\n"),
         ("mailto:a@b.c", "[go](mailto:a@b.c)\n"),
         ("tel:+15550100", "[go](tel:+15550100)\n"),
+        ("ftp://e.test", "[go](ftp://e.test)\n"),
+        ("ftps://e.test", "[go](ftps://e.test)\n"),
     ] {
         let md = doc(vec![Block::Paragraph(vec![Inline::Link {
             content: vec![Inline::plain("go")],

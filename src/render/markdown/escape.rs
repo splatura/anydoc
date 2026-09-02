@@ -329,9 +329,16 @@ pub(crate) fn url_scheme_allowed(url: &str) -> bool {
 /// or `#`, which a genuine relative reference can never contain in its first
 /// segment and which otherwise lets a scheme-bearing target (e.g.
 /// `javascript:`) hide behind the leading whitespace that routed it here
-/// instead of through [`url_scheme_allowed`].
+/// instead of through [`url_scheme_allowed`]. The same colon check also
+/// rejects Windows drive-letter paths (`C:\docs\a.doc`, `c:/docs/a.doc`) that
+/// [`crate::shared::uri::is_drive_path`] deliberately routes to
+/// `LinkTarget::Relative` rather than `External`; that is intentional, not a
+/// bug, since a bare `file:`-equivalent path is no safer than `file:` itself.
 pub(crate) fn relative_target_allowed(url: &str) -> bool {
     let trimmed = url.trim_start_matches(|c: char| c <= ' ');
+    if trimmed.is_empty() {
+        return false;
+    }
     let mut chars = trimmed.chars();
     let first = chars.next();
     let second = chars.next();
@@ -427,6 +434,21 @@ mod tests {
     fn unc_and_protocol_relative_targets_rejected() {
         assert!(!relative_target_allowed(r"\\evil\share"));
         assert!(!relative_target_allowed("//evil/x"));
+    }
+
+    #[test]
+    fn drive_letter_paths_rejected() {
+        // `is_drive_path` in src/shared/uri.rs routes these to
+        // `LinkTarget::Relative` on purpose; the colon-in-first-segment rule
+        // here rejects them for the same reason `file:` is disallowed, not
+        // by accident.
+        assert!(!relative_target_allowed(r"C:\docs\a.doc"));
+        assert!(!relative_target_allowed("c:/docs/a.doc"));
+    }
+
+    #[test]
+    fn whitespace_only_target_rejected() {
+        assert!(!relative_target_allowed("   "));
     }
 
     #[test]
