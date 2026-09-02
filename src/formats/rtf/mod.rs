@@ -740,6 +740,15 @@ impl<'a> Parser<'a> {
         self.state.capture != Capture::None || !self.state.suppress
     }
 
+    /// Whether inline content produced right now (text or a line break)
+    /// should actually reach the document: not inside a suppressed
+    /// destination, and not hidden (`\v`) or tracked-deletion (`\deleted`)
+    /// text. Structure control words (`\par`, `\row`, `\cell`) are not
+    /// inline content and must not be gated by this.
+    fn text_visible(&self) -> bool {
+        !self.state.suppress && !self.state.hidden && !self.state.deleted
+    }
+
     fn control_symbol(&mut self, b: u8) {
         match b {
             b'~' => self.push_char('\u{a0}'),
@@ -829,7 +838,12 @@ impl<'a> Parser<'a> {
             "par" | "sect" => {
                 self.flush_pending();
                 if self.state.note.is_some() {
-                    self.inlines.push(Inline::LineBreak);
+                    // A line break inside a note body is inline content,
+                    // not paragraph structure, so it is gated like any
+                    // other hidden/deleted text would be.
+                    if !self.state.hidden && !self.state.deleted {
+                        self.inlines.push(Inline::LineBreak);
+                    }
                 } else if !self.state.suppress {
                     self.end_paragraph()?;
                 }
@@ -850,7 +864,7 @@ impl<'a> Parser<'a> {
             // boundary they carry is not.
             "line" | "lbr" | "page" | "column" => {
                 self.flush_pending();
-                if !self.state.suppress {
+                if self.text_visible() {
                     self.inlines.push(Inline::LineBreak);
                 }
             }
@@ -1489,6 +1503,18 @@ mod tests {
     }
 
     #[test]
+    fn hidden_run_suppresses_line_breaks_too() {
+        // \line (and \lbr, \page, \column) push an inline line break
+        // directly onto the inline stream, bypassing the ordinary text
+        // path; they must still be gated by hidden/deleted like any other
+        // inline content produced from inside the run.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 A{\v hidden\line more}B}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "AB\n");
+    }
+
+    #[test]
     fn plain_clears_hidden_state() {
         let markdown =
             crate::to_markdown_bytes(br"{\rtf1 {\v HIDDEN\plain VISIBLE}}", crate::Format::Rtf)
@@ -1503,6 +1529,22 @@ mod tests {
         // leak into the visible text that follows.
         let markdown =
             crate::to_markdown_bytes(br"{\rtf1\uc1 {\v \u9639 ?}Visible}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "Visible\n");
+    }
+
+    #[test]
+    fn hidden_unicode_fallback_skip_survives_the_v0_boundary() {
+        // \uc2 arms a two-byte fallback skip per \u escape. Here only the
+        // first fallback byte lands before \v0 turns hidden text back off;
+        // the second lands after, while the run is visible again. The skip
+        // counter lives on the decoder, not on the per-group CharState, so
+        // it must still swallow that second byte instead of leaking it in
+        // front of "Visible". An implementation that stopped honoring the
+        // skip while hidden (or reset it at \v0) would render "YVisible" or
+        // eat into "Visible" itself.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1\uc2 {\v\u9639 XY\v0 Visible}}", crate::Format::Rtf)
                 .unwrap();
         assert_eq!(markdown, "Visible\n");
     }
