@@ -184,6 +184,7 @@ pub fn rpr_delta(rpr: &Element) -> StyleDelta {
             None
         },
         code: None,
+        hidden: None,
     }
 }
 

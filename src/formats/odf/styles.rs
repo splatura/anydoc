@@ -234,5 +234,6 @@ pub fn text_properties_delta(elem: &Element) -> StyleDelta {
         italic: props.attr(ns::FO, "font-style").map(|s| s == "italic" || s == "oblique"),
         strike: props.attr(ns::STYLE, "text-line-through-style").map(|lt| lt != "none"),
         code: None,
+        hidden: None,
     }
 }

@@ -10,6 +10,12 @@ pub struct StyleDelta {
     pub italic: Option<bool>,
     pub strike: Option<bool>,
     pub code: Option<bool>,
+    /// Author-hidden text (Word `w:vanish`/`w:webHidden`, RTF `\v`, ODF
+    /// `text:display="none"`, ...). Resolved through the cascade like the
+    /// other properties, then consulted by the frontend: content that
+    /// resolves hidden is omitted from the document model. It never reaches
+    /// [`Style`], which describes only visible content.
+    pub hidden: Option<bool>,
 }
 
 impl StyleDelta {
@@ -21,6 +27,7 @@ impl StyleDelta {
             italic: child.italic.or(self.italic),
             strike: child.strike.or(self.strike),
             code: child.code.or(self.code),
+            hidden: child.hidden.or(self.hidden),
         }
     }
 
