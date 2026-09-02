@@ -2266,6 +2266,9 @@ def hidden_docx():
         f'<w:t xml:space="preserve">HIDDEN-STYLE-VANISH-RUN</w:t></w:r></w:p>',
         f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/><w:vanish w:val="0"/></w:rPr>'
         f'<w:t xml:space="preserve">KEEP-STYLE-OVERRIDE-RUN</w:t></w:r></w:p>',
+        f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/><w:vanish w:val="false"/></w:rPr>'
+        f'<w:t xml:space="preserve">KEEP-STYLE-OVERRIDE-FALSE</w:t></w:r></w:p>',
+        f"<w:p>{run('KEEP-BEFORE ')}{run('HIDDEN-INLINE', '<w:vanish/>')}{run(' KEEP-AFTER.')}</w:p>",
         f'<w:p><w:hyperlink r:id="rIdJs">{run("js-link")}</w:hyperlink></w:p>',
         f'<w:p><w:hyperlink r:id="rIdOk">{run("ok-link")}</w:hyperlink></w:p>',
         f"<w:p><w:r>{drawing_link}</w:r></w:p>",
@@ -2304,6 +2307,7 @@ def hidden_rtf():
         r"\pard KEEP-VISIBLE text.\par",
         r"\pard {\v HIDDEN-V-GROUP text}KEEP-AFTER-V-GROUP.\par",
         r"\pard \v HIDDEN-V-TOGGLE text\v0  KEEP-AFTER-TOGGLE.\par",
+        r"\pard {\v HIDDEN-V-INNER \v0 KEEP-V0-INSIDE-GROUP} KEEP-AFTER.\par",
         r"\pard {\deleted HIDDEN-DELETED text}KEEP-AFTER-DELETED.\par",
         r"\pard {\revised KEEP-REVISED text}\par",
         r'\pard {\field{\*\fldinst HYPERLINK "javascript:alert(1)"}{\fldrslt js-link}}\par',
