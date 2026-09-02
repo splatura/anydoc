@@ -339,17 +339,35 @@ impl Extractor {
                     .and_then(|(.., atom)| get_u32(atom, 0))
                     .filter(|&v| v != 0);
             } else if slide_container_hidden(body) {
-                // Hidden slides are omitted with no option: skip the
-                // slide's own text; paired notes are dropped in
-                // `into_blocks` via `hidden_slides`.
+                // Hidden slides are omitted with no option. The slide's
+                // outline text (TextHeaderAtom + TextCharsAtom/TextBytesAtom)
+                // is a sibling of the SlidePersistAtom in the
+                // SlideListWithText, so it has already been fed through
+                // `record`/`atom` into `self.pending`/`self.current` before
+                // this runs (see `walk_slide_list`) - discard it along with
+                // any list run in progress before returning, or
+                // `end_segment` would push it as this slide's content.
+                // Paired notes are dropped in `into_blocks` via
+                // `hidden_slides`.
                 if let Some(sid) = id {
                     self.hidden_slides.insert(sid);
                 }
+                self.discard_current_segment();
                 return Ok(id);
             }
             self.walk(body)?;
         }
         Ok(id)
+    }
+
+    /// Drop everything accumulated for the segment in progress (pending
+    /// shape, flushed blocks, in-progress list run) without emitting it -
+    /// used when a hidden slide's outline text has already arrived via
+    /// `record` before its SlideShowSlideInfoAtom is seen.
+    fn discard_current_segment(&mut self) {
+        self.pending = None;
+        self.current.clear();
+        self.list_run.clear();
     }
 
     fn end_segment(&mut self, id: Option<u32>) {
@@ -759,10 +777,18 @@ mod tests {
         for (slide_ref, text) in notes {
             parts.push(notes_container(*slide_ref, text));
         }
+        assemble_stream(&parts)
+    }
 
+    /// Assemble a "PowerPoint Document" + "Current User" OLE stream from
+    /// `parts` laid out back to back, where `parts[0]` is the
+    /// DocumentContainer (persist id 1) and every following part gets
+    /// persist ids from 2, in order. Builds the persist directory and
+    /// UserEditAtom chain the reader's persist-chain walk resolves through.
+    fn assemble_stream(parts: &[Vec<u8>]) -> Vec<u8> {
         let mut stream = Vec::new();
         let mut offsets = Vec::with_capacity(parts.len());
-        for part in &parts {
+        for part in parts {
             offsets.push(stream.len() as u32);
             stream.extend_from_slice(part);
         }
@@ -833,5 +859,41 @@ mod tests {
         let text = all_text(&doc.blocks);
         assert!(!text.contains("Notes for the hidden slide"), "orphaned notes leaked: {text}");
         assert!(text.contains("Visible slide text"));
+    }
+
+    #[test]
+    fn hidden_slide_skips_outline_text_stored_in_the_slide_list() {
+        // Realistic layout: PowerPoint stores a slide's outline (title/body
+        // placeholder) text as a TextHeaderAtom + TextBytesAtom pair that is
+        // a *sibling* of the SlidePersistAtom directly in the
+        // SlideListWithText, not inside the SlideContainer (`slide_container`
+        // above places it in the SlideContainer instead, which does not
+        // exercise this path). The SlideContainer here carries only the
+        // SlideShowSlideInfoAtom marking it hidden.
+        fn outline(text: &str) -> Vec<u8> {
+            let mut body = rec(0, 0x0F9F, &1u32.to_le_bytes()); // TextHeaderAtom: body text
+            body.extend(rec(0, 0x0FA8, text.as_bytes())); // TextBytesAtom
+            body
+        }
+        let mut slide_list_body = persist_atom(2, 256);
+        slide_list_body.extend(outline("Hidden outline text"));
+        slide_list_body.extend(persist_atom(3, 257));
+        slide_list_body.extend(outline("Visible outline text"));
+        let doc_body = container(0, 0x0FF0, &slide_list_body);
+        let doc = container(0, 0x03E8, &doc_body);
+
+        let slide_atom = rec(2, 0x03EF, &[0u8; 24]);
+        let mut hidden_info = vec![0u8; 12];
+        hidden_info[10..12].copy_from_slice(&0x0004u16.to_le_bytes());
+        let mut hidden_body = slide_atom.clone();
+        hidden_body.extend(rec(0, 0x03F9, &hidden_info));
+        let hidden_slide = container(0, 0x03EE, &hidden_body);
+        let visible_slide = container(0, 0x03EE, &slide_atom);
+
+        let bytes = assemble_stream(&[doc, hidden_slide, visible_slide]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(!text.contains("Hidden outline text"), "hidden slide outline text leaked: {text}");
+        assert!(text.contains("Visible outline text"));
     }
 }

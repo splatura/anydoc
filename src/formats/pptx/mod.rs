@@ -137,7 +137,12 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
             // Hidden slides (and their speaker notes) are omitted entirely
             // (fixed policy, no option). This is not a read failure, so it
             // never counts toward the all-failed check below: an all-hidden
-            // deck converts to an empty document, not an error.
+            // deck converts to an empty document, not an error. Slide
+            // numbering (`slide-{i+1}`) is unaffected since it comes from
+            // `slide_paths` order, computed before this loop; an internal
+            // link from another slide to this one keeps pointing at its
+            // anchor id even though that anchor is never emitted here - the
+            // same dangling-link tradeoff an unreadable slide already has.
             continue;
         }
         let Some(sp_tree) = sld.find(ns::P, "cSld").and_then(|c| c.find(ns::P, "spTree")) else {
@@ -201,21 +206,22 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
                 ..ctx
             };
             let mut notes_blocks = Vec::new();
-            for sp in notes_tree.descendants(ns::P, "sp") {
-                // Hidden shapes are omitted (fixed policy, no option). Keep
-                // note text bodies (real producers use a body placeholder;
-                // LibreOffice writes plain text boxes) but skip the
-                // slide-image and chrome placeholders.
-                if shape_hidden(sp)
-                    || matches!(
+            if let Some(sp_tree) = notes_tree.first_descendant(ns::P, "spTree") {
+                let mut shapes = Vec::new();
+                collect_notes_shapes(sp_tree, &mut shapes);
+                for sp in shapes {
+                    // Keep note text bodies (real producers use a body
+                    // placeholder; LibreOffice writes plain text boxes) but
+                    // skip the slide-image and chrome placeholders.
+                    if matches!(
                         placeholder_type(sp),
                         Some("sldImg" | "sldNum" | "hdr" | "ftr" | "dt")
-                    )
-                {
-                    continue;
-                }
-                if let Some(tx) = sp.find(ns::P, "txBody") {
-                    parse_text_body(tx, &notes_ctx, None, &mut notes_blocks)?;
+                    ) {
+                        continue;
+                    }
+                    if let Some(tx) = sp.find(ns::P, "txBody") {
+                        parse_text_body(tx, &notes_ctx, None, &mut notes_blocks)?;
+                    }
                 }
             }
             if !notes_blocks.is_empty() {
@@ -362,6 +368,28 @@ fn slide_hidden(sld: &Element) -> bool {
 fn shape_hidden(el: &Element) -> bool {
     el.first_descendant(ns::P, "cNvPr")
         .is_some_and(|c| matches!(c.attr(ns::P, "hidden"), Some("1") | Some("true")))
+}
+
+/// Collect visible `p:sp` shapes from a notes shape tree, depth-first:
+/// hidden shapes (own `p:cNvPr hidden`) are skipped with their descendants -
+/// same policy as slides - so a hidden `p:grpSp` drops every child even when
+/// a child's own `cNvPr` is not itself marked hidden.
+fn collect_notes_shapes<'a>(parent: &'a Element, out: &mut Vec<&'a Element>) {
+    for child in parent.child_elems() {
+        if child.ns.as_deref().is_none_or(|n| n != ns::P) {
+            continue;
+        }
+        if matches!(child.local.as_str(), "sp" | "cxnSp" | "grpSp" | "graphicFrame" | "pic")
+            && shape_hidden(child)
+        {
+            continue;
+        }
+        match child.local.as_str() {
+            "sp" => out.push(child),
+            "grpSp" => collect_notes_shapes(child, out),
+            _ => {}
+        }
+    }
 }
 
 fn parse_shapes(
@@ -868,6 +896,49 @@ mod tests {
         assert_eq!(text, "Speaker notes");
         assert!(style.bold, "speaker notes label must be bold");
         assert!(all_text(quote).contains("Note body text"));
+    }
+
+    #[test]
+    fn hidden_group_in_notes_is_skipped_with_its_children() {
+        // A hidden `p:grpSp` in the notes tree must drop every descendant
+        // shape, even one whose own `p:cNvPr` is not itself marked hidden.
+        let slide = slide_xml(false, &text_shape(2, "Content", "Slide body", false));
+        let notes_rels = r#"<Relationships
+            xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+                Target="../notesSlides/notesSlide1.xml"/>
+            </Relationships>"#;
+        let notes = format!(
+            r#"<p:notes {NS}>
+            <p:cSld><p:spTree>
+            <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            <p:grpSp><p:nvGrpSpPr><p:cNvPr id="2" name="Hidden group" hidden="1"/>
+            <p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+            {}
+            </p:grpSp>
+            {}
+            </p:spTree></p:cSld>
+            </p:notes>"#,
+            text_shape(3, "Grouped", "Hidden group child text", false),
+            text_shape(4, "Visible", "Visible note text", false),
+        );
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1"])),
+            ("ppt/_rels/presentation.xml.rels", &pres_rels(&[("rId1", "slides/slide1.xml")])),
+            ("ppt/slides/slide1.xml", &slide),
+            ("ppt/slides/_rels/slide1.xml.rels", notes_rels),
+            ("ppt/notesSlides/notesSlide1.xml", &notes),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(
+            !text.contains("Hidden group child text"),
+            "hidden group child leaked in notes: {text}"
+        );
+        assert!(text.contains("Visible note text"));
     }
 
     #[test]
