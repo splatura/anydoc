@@ -2238,6 +2238,251 @@ def ocr_pdfs():
     (OUT / "pdf" / "handmade-mixed.pdf").write_bytes(handmade_pdf([TEXT_PAGE, IMAGE_PAGE]))
 
 
+# ---------------------------------------------------------------------------
+# Security-review probes: hidden content and output-injection sentinels.
+# Every fixture below pairs a KEEP-* sentinel (must survive conversion) with
+# a HIDDEN-* sentinel (must not appear in the Markdown output) so a snapshot
+# review can tell at a glance which behavior is correct.
+#
+# Determinism note: these generators are deterministic in decompressed part
+# content, not necessarily in the compressed archive bytes. A different zlib
+# build (e.g. zlib-ng vs. stock zlib) can lay out DEFLATE output differently
+# for the same input, so `git status` may show a fixture as modified when
+# regenerated on a different machine even though every zip member's
+# decompressed content is unchanged; diff the unzipped entries before
+# assuming content drifted.
+
+def hidden_docx():
+    def run(text, rpr=""):
+        rp = f"<w:rPr>{rpr}</w:rPr>" if rpr else ""
+        return f'<w:r>{rp}<w:t xml:space="preserve">{text}</w:t></w:r>'
+
+    drawing_link = (
+        '<w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+        '<wp:extent cx="100000" cy="100000"/><wp:docPr id="1" name="Pixel" descr="remote-image-alt"/>'
+        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:blipFill><a:blip r:link="rIdImg"/></pic:blipFill>'
+        "</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"
+    )
+    body = "".join([
+        f"<w:p>{run('KEEP-VISIBLE paragraph.')}</w:p>",
+        # Paragraph-mark-only vanish: <w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr> hides
+        # only the pilcrow, not the runs. A parser that treats any w:vanish descendant
+        # of w:p as "hide the whole paragraph" would wrongly drop this run.
+        f'<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr>{run("KEEP-PARAMARK-VANISH")}</w:p>',
+        f'<w:p>{run("HIDDEN-VANISH-RUN", "<w:vanish/>")}</w:p>',
+        f'<w:p>{run("HIDDEN-WEBHIDDEN-RUN", "<w:webHidden/>")}</w:p>',
+        f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/></w:rPr>'
+        f'<w:t xml:space="preserve">HIDDEN-STYLE-VANISH-RUN</w:t></w:r></w:p>',
+        f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/><w:vanish w:val="0"/></w:rPr>'
+        f'<w:t xml:space="preserve">KEEP-STYLE-OVERRIDE-RUN</w:t></w:r></w:p>',
+        f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/><w:vanish w:val="false"/></w:rPr>'
+        f'<w:t xml:space="preserve">KEEP-STYLE-OVERRIDE-FALSE</w:t></w:r></w:p>',
+        f"<w:p>{run('KEEP-BEFORE ')}{run('HIDDEN-INLINE', '<w:vanish/>')}{run(' KEEP-AFTER.')}</w:p>",
+        f'<w:p><w:hyperlink r:id="rIdJs">{run("js-link")}</w:hyperlink></w:p>',
+        f'<w:p><w:hyperlink r:id="rIdOk">{run("ok-link")}</w:hyperlink></w:p>',
+        f"<w:p><w:r>{drawing_link}</w:r></w:p>",
+        f'<w:p><m:oMath>{omml_run("&lt;script&gt;alert(1)&lt;/script&gt;")}</m:oMath></w:p>',
+        f'<w:p><m:oMath>{omml_run("a&lt;b")}</m:oMath></w:p>',
+    ])
+    document = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f'<w:document {W} {R} {M_NS}><w:body>{body}</w:body></w:document>')
+    styles = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles {W}>
+<w:docDefaults><w:rPrDefault><w:rPr/></w:rPrDefault></w:docDefaults>
+<w:style w:type="character" w:styleId="HiddenChar">
+  <w:name w:val="Hidden Char"/><w:rPr><w:vanish/></w:rPr>
+</w:style>
+</w:styles>"""
+    doc_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+<Relationship Id="rIdJs" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="javascript:alert(1)" TargetMode="External"/>
+<Relationship Id="rIdOk" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.invalid/ok" TargetMode="External"/>
+<Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="http://example.invalid/pixel.png" TargetMode="External"/>
+</Relationships>"""
+    ct = CONTENT_TYPES_BASE.format(extra="")
+    write_zip(OUT / "docx" / "handmade-hidden.docx", [
+        ("[Content_Types].xml", ct),
+        ("_rels/.rels", ROOT_RELS),
+        ("word/document.xml", document),
+        ("word/_rels/document.xml.rels", doc_rels),
+        ("word/styles.xml", styles),
+    ])
+
+
+def hidden_rtf():
+    parts = [
+        r"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0 Arial;}}",
+        r"\pard KEEP-VISIBLE text.\par",
+        r"\pard {\v HIDDEN-V-GROUP text}KEEP-AFTER-V-GROUP.\par",
+        r"\pard \v HIDDEN-V-TOGGLE text\v0  KEEP-AFTER-TOGGLE.\par",
+        r"\pard {\v HIDDEN-V-INNER \v0 KEEP-V0-INSIDE-GROUP} KEEP-AFTER.\par",
+        r"\pard {\deleted HIDDEN-DELETED text}KEEP-AFTER-DELETED.\par",
+        r"\pard {\revised KEEP-REVISED text}\par",
+        r'\pard {\field{\*\fldinst HYPERLINK "javascript:alert(1)"}{\fldrslt js-link}}\par',
+        r'\pard {\field{\*\fldinst HYPERLINK "https://example.invalid/ok"}{\fldrslt ok-link}}\par',
+        "}",
+    ]
+    (OUT / "rtf").mkdir(parents=True, exist_ok=True)
+    (OUT / "rtf" / "handmade-hidden.rtf").write_bytes("\n".join(parts).encode("cp1252"))
+
+
+def hidden_pptx():
+    presentation = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation {PPTX_NS}>
+<p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId3"/></p:sldIdLst>
+</p:presentation>"""
+    pres_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide2.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide3.xml"/>
+</Relationships>"""
+
+    def sp(id_, name, text, extra_cnvpr=""):
+        return (f'<p:sp><p:nvSpPr><p:cNvPr id="{id_}" name="{name}"{extra_cnvpr}/>'
+                '<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>'
+                f'<a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>')
+
+    slide1 = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld {PPTX_NS}>
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+{sp(2, "Box1", "KEEP-SLIDE-1")}
+</p:spTree></p:cSld></p:sld>"""
+    slide1_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdNotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+</Relationships>"""
+
+    slide2 = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld show="0" {PPTX_NS}>
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+{sp(2, "Box2", "HIDDEN-SLIDE-2")}
+</p:spTree></p:cSld></p:sld>"""
+
+    slide3 = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld {PPTX_NS}>
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+{sp(2, "HiddenShape", "HIDDEN-SHAPE", ' hidden="1"')}
+{sp(3, "VisibleShape", "KEEP-SHAPE")}
+</p:spTree></p:cSld></p:sld>"""
+
+    notes1 = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notes {PPTX_NS}>
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+<p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr/>
+<p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+<p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>KEEP-NOTE</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:notes>"""
+
+    ct = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+<Override PartName="/ppt/slides/slide2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+<Override PartName="/ppt/slides/slide3.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+<Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>
+</Types>"""
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"""
+    write_zip(OUT / "pptx" / "handmade-hidden.pptx", [
+        ("[Content_Types].xml", ct),
+        ("_rels/.rels", root_rels),
+        ("ppt/presentation.xml", presentation),
+        ("ppt/_rels/presentation.xml.rels", pres_rels),
+        ("ppt/slides/slide1.xml", slide1),
+        ("ppt/slides/_rels/slide1.xml.rels", slide1_rels),
+        ("ppt/slides/slide2.xml", slide2),
+        ("ppt/slides/slide3.xml", slide3),
+        ("ppt/notesSlides/notesSlide1.xml", notes1),
+    ])
+
+
+def hidden_epub():
+    ch1 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Hidden</title>
+<style>.gone { display: none; }</style></head><body>
+<h1>Hidden Content Probe</h1>
+<p>KEEP-VISIBLE paragraph.</p>
+<p>KEEP-VIS:<span style="visibility: hidden">HIDDEN-VISIBILITY</span>
+KEEP-OP:<span style="opacity: 0">HIDDEN-OPACITY</span>
+KEEP-FS:<span style="font-size: 0">HIDDEN-FONTSIZE</span></p>
+<p class="gone">HIDDEN-GONE paragraph.</p>
+<p hidden="hidden">HIDDEN-ATTR paragraph.</p>
+<p aria-hidden="true">HIDDEN-ARIA paragraph.</p>
+<div style="display: none"><p style="display: block">HIDDEN-NESTED paragraph.</p></div>
+<p>Links: <a href="javascript:alert(1)">js</a> <a href="data:text/html,x">data</a>
+<a href="https://example.invalid/">ok</a> <a href="//example.invalid/x">proto-relative</a>.</p>
+<p><img src="http://example.invalid/pixel.png" alt="remote-alt"/>
+<img src="data:image/svg+xml,x" alt="data-alt"/></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi>
+<annotation encoding="application/x-tex">&lt;script&gt;alert(2)&lt;/script&gt;</annotation>
+</semantics></math></p>
+</body></html>"""
+    opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="uid">urn:uuid:00000000-0000-0000-0000-00000000h1dn</dc:identifier>
+<dc:title>Hidden Book</dc:title><dc:language>en</dc:language>
+</metadata>
+<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c1"/></spine>
+</package>"""
+    container = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"""
+    write_zip(OUT / "epub" / "handmade-hidden.epub", [
+        ("META-INF/container.xml", container),
+        ("OEBPS/content.opf", opf),
+        ("OEBPS/ch1.xhtml", ch1),
+    ], mimetype_first="application/epub+zip")
+
+
+def hidden_odf():
+    odt_content = """<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+<office:automatic-styles>
+<style:style style:name="T1" style:family="text">
+<style:text-properties text:display="none"/>
+</style:style>
+</office:automatic-styles>
+<office:body><office:text>
+<text:p>KEEP-ODT <text:span text:style-name="T1">HIDDEN-ODT-SPAN</text:span> after.</text:p>
+</office:text></office:body></office:document-content>"""
+    write_zip(OUT / "odt" / "handmade-hidden.odt",
+              [("content.xml", odt_content)],
+              mimetype_first="application/vnd.oasis.opendocument.text")
+
+    ods_content = """<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+<office:body><office:spreadsheet>
+<table:table table:name="Hidden">
+<table:table-row><table:table-cell office:value-type="string"><text:p>KEEP-ROW</text:p></table:table-cell></table:table-row>
+<table:table-row table:visibility="collapse"><table:table-cell office:value-type="string"><text:p>HIDDEN-ROW</text:p></table:table-cell></table:table-row>
+<table:table-row table:visibility="collapse" table:number-rows-repeated="3"><table:table-cell office:value-type="string"><text:p>HIDDEN-ROW-REPEAT</text:p></table:table-cell></table:table-row>
+</table:table>
+</office:spreadsheet></office:body></office:document-content>"""
+    write_zip(OUT / "ods" / "handmade-hidden.ods",
+              [("content.xml", ods_content)],
+              mimetype_first="application/vnd.oasis.opendocument.spreadsheet")
+
+
 def main():
     skip_office = "--skip-office" in sys.argv
     for sub in ["odt", "docx", "doc", "rtf", "ods", "xlsx", "xls", "csv",
@@ -2296,6 +2541,11 @@ def main():
     math_epub()
     math_rtf()
     csvs()
+    hidden_docx()
+    hidden_rtf()
+    hidden_pptx()
+    hidden_epub()
+    hidden_odf()
     malformed()
     abuse()
     print("fixture generation complete")
