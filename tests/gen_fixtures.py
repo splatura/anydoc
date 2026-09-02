@@ -2243,6 +2243,14 @@ def ocr_pdfs():
 # Every fixture below pairs a KEEP-* sentinel (must survive conversion) with
 # a HIDDEN-* sentinel (must not appear in the Markdown output) so a snapshot
 # review can tell at a glance which behavior is correct.
+#
+# Determinism note: these generators are deterministic in decompressed part
+# content, not necessarily in the compressed archive bytes. A different zlib
+# build (e.g. zlib-ng vs. stock zlib) can lay out DEFLATE output differently
+# for the same input, so `git status` may show a fixture as modified when
+# regenerated on a different machine even though every zip member's
+# decompressed content is unchanged; diff the unzipped entries before
+# assuming content drifted.
 
 def hidden_docx():
     def run(text, rpr=""):
@@ -2260,6 +2268,10 @@ def hidden_docx():
     )
     body = "".join([
         f"<w:p>{run('KEEP-VISIBLE paragraph.')}</w:p>",
+        # Paragraph-mark-only vanish: <w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr> hides
+        # only the pilcrow, not the runs. A parser that treats any w:vanish descendant
+        # of w:p as "hide the whole paragraph" would wrongly drop this run.
+        f'<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr>{run("KEEP-PARAMARK-VANISH")}</w:p>',
         f'<w:p>{run("HIDDEN-VANISH-RUN", "<w:vanish/>")}</w:p>',
         f'<w:p>{run("HIDDEN-WEBHIDDEN-RUN", "<w:webHidden/>")}</w:p>',
         f'<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/></w:rPr>'
@@ -2403,9 +2415,9 @@ def hidden_epub():
 <style>.gone { display: none; }</style></head><body>
 <h1>Hidden Content Probe</h1>
 <p>KEEP-VISIBLE paragraph.</p>
-<p>vis:<span style="visibility: hidden">HIDDEN-VISIBILITY</span>
-op:<span style="opacity: 0">HIDDEN-OPACITY</span>
-fs:<span style="font-size: 0">HIDDEN-FONTSIZE</span></p>
+<p>KEEP-VIS:<span style="visibility: hidden">HIDDEN-VISIBILITY</span>
+KEEP-OP:<span style="opacity: 0">HIDDEN-OPACITY</span>
+KEEP-FS:<span style="font-size: 0">HIDDEN-FONTSIZE</span></p>
 <p class="gone">HIDDEN-GONE paragraph.</p>
 <p hidden="hidden">HIDDEN-ATTR paragraph.</p>
 <p aria-hidden="true">HIDDEN-ARIA paragraph.</p>
