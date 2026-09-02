@@ -232,10 +232,13 @@ pub fn rpr_delta(rpr: &Element) -> StyleDelta {
             None
         },
         code: None,
-        hidden: if v.is_some() || wh.is_some() {
-            Some(v.unwrap_or(false) || wh.unwrap_or(false))
-        } else {
-            None
+        // Either property hides; only an explicit `vanish` off un-hides. A
+        // lone `webHidden` off says nothing about `vanish`, so it must not
+        // reveal text a style hid.
+        hidden: match (v, wh) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), _) => Some(false),
+            _ => None,
         },
     }
 }
@@ -274,6 +277,29 @@ mod tests {
             ));
             let rpr = root.find(ns::W, "rPr").unwrap();
             assert_eq!(on_off(rpr, "b"), expect, "for {xml:?}");
+        }
+    }
+
+    /// `w:webHidden` can only hide. An explicit `webHidden` off on its own
+    /// says nothing about `vanish`, so it must not un-hide text a style hid;
+    /// only an explicit `vanish` off does that.
+    #[test]
+    fn web_hidden_off_alone_leaves_hidden_unspecified() {
+        for (xml, expect) in [
+            (r#"<w:vanish/>"#, Some(true)),
+            (r#"<w:webHidden/>"#, Some(true)),
+            (r#"<w:vanish w:val="0"/><w:webHidden/>"#, Some(true)),
+            (r#"<w:vanish/><w:webHidden w:val="0"/>"#, Some(true)),
+            (r#"<w:vanish w:val="0"/>"#, Some(false)),
+            (r#"<w:vanish w:val="0"/><w:webHidden w:val="0"/>"#, Some(false)),
+            (r#"<w:webHidden w:val="0"/>"#, None),
+            ("", None),
+        ] {
+            let root = parse(&format!(
+                r#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{xml}</w:rPr>"#
+            ));
+            let rpr = root.find(ns::W, "rPr").unwrap();
+            assert_eq!(rpr_delta(rpr).hidden, expect, "for {xml:?}");
         }
     }
 

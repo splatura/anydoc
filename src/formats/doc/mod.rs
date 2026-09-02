@@ -783,7 +783,12 @@ impl Assembler {
                         self.emit_paragraph(&pap, inlines, &mut blocks, &mut list_run, &mut styled);
                     }
                 }
-                '\u{b}' => para.push_inline(Inline::LineBreak),
+                '\u{b}' => {
+                    let (_, hidden) = self.char_style(fc, i);
+                    if !hidden {
+                        para.push_inline(Inline::LineBreak);
+                    }
+                }
                 '\u{13}' => para.field_begin(),
                 '\u{14}' => para.field_separate(),
                 '\u{15}' => para.field_end(),
