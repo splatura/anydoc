@@ -1030,8 +1030,10 @@ impl<'a> Parser<'a> {
             "result" => self.state.suppress = false,
             "pict" => {
                 // A pict inside a suppressed destination (the nonshppict
-                // fallback, excluded headers) is not extracted.
-                if !self.state.suppress {
+                // fallback, excluded headers) is not extracted; nor is one
+                // inside hidden (`\v`) or tracked-deletion (`\deleted`) text,
+                // matching how the rest of that run's content is dropped.
+                if self.text_visible() {
                     self.flush_pending();
                     self.state.capture = Capture::Pict;
                     self.dest.pict =
@@ -1056,7 +1058,12 @@ impl<'a> Parser<'a> {
             if word != "mmath" {
                 return false;
             }
-            if !self.state.suppress {
+            // A math zone opened inside hidden (`\v`) or tracked-deletion
+            // (`\deleted`) text is not captured either: with no `MathState`
+            // the inner `\m*` words fall through unrecognized, and the
+            // zone's plain text then reaches `push_text`, which drops it as
+            // hidden/deleted like any other run.
+            if self.text_visible() {
                 self.flush_pending();
                 self.state.capture = Capture::Math;
                 self.dest.math = Some(MathState::new(self.stack.len()));
@@ -1531,6 +1538,24 @@ mod tests {
             crate::to_markdown_bytes(br"{\rtf1\uc1 {\v \u9639 ?}Visible}", crate::Format::Rtf)
                 .unwrap();
         assert_eq!(markdown, "Visible\n");
+    }
+
+    #[test]
+    fn hidden_math_zone_is_dropped_entirely() {
+        // The zone itself is not captured (no MathState), so its `\m*`
+        // control words fall through unrecognized and its plain text is
+        // dropped by push_text like any other hidden content, instead of
+        // reaching the document as a rendered `Inline::Math`.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 A{\v {\mmath{\mr x}}}B}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "AB\n");
+    }
+
+    #[test]
+    fn hidden_pict_is_not_extracted_as_an_asset() {
+        let doc = parse(br"{\rtf1 A{\v {\pict\pngblip 89504e470d0a1a0a}}B}").unwrap();
+        assert!(doc.assets.is_empty(), "assets: {:?}", doc.assets);
     }
 
     #[test]
