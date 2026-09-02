@@ -117,9 +117,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuses every redirect so the Authorization header can never reach a
     second origin. Passing an instance to `build_opener` replaces its
     default `HTTPRedirectHandler`, which would otherwise follow 301/302/303
-    (and, since the request is a POST, resend the header on 307/308 too)."""
+    on a POST by resending it as a GET carrying every header but
+    Content-Length/Content-Type. 307/308 are refused here too for
+    consistency, though stock urllib already raises for those on a POST."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
         raise _RedirectRefused(code, newurl)
 
 
@@ -149,7 +152,7 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
         with _OPENER.open(request, timeout=_TIMEOUT_SECONDS) as response:
             status, reply = response.status, _json(response.read())
     except _RedirectRefused as error:
-        host = urllib.parse.urlsplit(error.location).netloc or error.location
+        host = _redirect_host(error.location)
         raise HostedError(
             f"Firecrawl Parse redirected the request to {host}; refusing to follow"
         ) from error
@@ -165,6 +168,20 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     if not isinstance(markdown, str) or not markdown:
         raise HostedError("Firecrawl Parse returned no Markdown")
     return markdown if markdown.endswith("\n") else markdown + "\n"
+
+
+def _redirect_host(location: str) -> str:
+    """The host:port a redirect `Location` names, without any userinfo it
+    might carry (the message only intends to name a host, not credentials
+    an attacker-controlled response happened to include)."""
+    try:
+        parts = urllib.parse.urlsplit(location)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return location
+    if not host:
+        return location
+    return f"{host}:{port}" if port else host
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:

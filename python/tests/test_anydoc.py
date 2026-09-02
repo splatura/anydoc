@@ -4,6 +4,7 @@ import ast
 import io
 import json
 import os
+import re
 import threading
 import unittest
 import zipfile
@@ -65,20 +66,25 @@ def hosted_stub(status, body):
 def redirect_stub(status):
     """Two loopback stubs. The second would serve a normal hosted reply, but
     should never be asked: the first answers every POST with a `status`
-    redirect to it. Yields the first stub's `api_url` and the second stub's
-    hit count, so a test can assert the second stub was never reached."""
+    redirect to it. Yields the first stub's `api_url`, the target's host,
+    and the second stub's hits, so a test can assert the second stub was
+    never reached by any method -- urllib's default handler follows a
+    redirected POST by converting it to a GET, so a stub that only defined
+    `do_POST` would silently miss that request."""
     target_hits = []
 
     class TargetHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("content-length", 0)))
-            target_hits.append(self.headers.get("Authorization"))
+            target_hits.append((self.command, self.headers.get("Authorization")))
             reply = json.dumps({"success": True, "data": {"markdown": HOSTED_MARKDOWN}}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(reply)))
             self.end_headers()
             self.wfile.write(reply)
+
+        do_GET = do_HEAD = do_POST
 
         def log_message(self, *args):
             pass
@@ -100,7 +106,7 @@ def redirect_stub(status):
     front = HTTPServer(("127.0.0.1", 0), FrontHandler)
     threading.Thread(target=front.serve_forever, daemon=True).start()
     try:
-        yield f"http://127.0.0.1:{front.server_port}", target_hits
+        yield f"http://127.0.0.1:{front.server_port}", f"127.0.0.1:{target.server_port}", target_hits
     finally:
         for server in (front, target):
             server.shutdown()
@@ -193,14 +199,16 @@ class AnydocTest(unittest.TestCase):
                 anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted")
 
     def test_a_302_redirect_is_refused_and_the_api_key_never_reaches_the_target(self):
-        with redirect_stub(302) as (api_url, target_hits):
-            with self.assertRaisesRegex(anydoc.HostedError, "redirected"):
+        with redirect_stub(302) as (api_url, target_host, target_hits):
+            redirected = f"redirected the request to {re.escape(target_host)}"
+            with self.assertRaisesRegex(anydoc.HostedError, redirected):
                 anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
             self.assertEqual(target_hits, [])
 
     def test_a_307_redirect_is_refused_and_the_api_key_never_reaches_the_target(self):
-        with redirect_stub(307) as (api_url, target_hits):
-            with self.assertRaisesRegex(anydoc.HostedError, "redirected"):
+        with redirect_stub(307) as (api_url, target_host, target_hits):
+            redirected = f"redirected the request to {re.escape(target_host)}"
+            with self.assertRaisesRegex(anydoc.HostedError, redirected):
                 anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
             self.assertEqual(target_hits, [])
 
