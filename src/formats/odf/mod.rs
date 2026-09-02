@@ -410,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn hidden_table_row_group_is_dropped() {
+        // ODF 1.2 SS19.615: `table:display="false"` on a whole
+        // `table:table-row-group` hides every row in it, same as a row's
+        // own `table:visibility`.
+        let rows = r#"
+            <table:table-row><table:table-cell><text:p>keep</text:p></table:table-cell></table:table-row>
+            <table:table-row-group table:display="false">
+                <table:table-row><table:table-cell><text:p>hidden1</text:p></table:table-cell></table:table-row>
+                <table:table-row><table:table-cell><text:p>hidden2</text:p></table:table-cell></table:table-row>
+            </table:table-row-group>
+        "#;
+        let doc = parse(&odt_with_content(&table_doc(rows))).unwrap();
+        let [Block::Table(table)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(table.grid.len(), 1, "the hidden group's rows must not appear: {table:?}");
+    }
+
+    #[test]
     fn repeated_collapsed_rows_are_dropped_without_charging_the_expansion_budget() {
         // A hidden row's repeats must not even be charged against the
         // expansion budget - they never enter the grid at all.

@@ -90,10 +90,11 @@ fn parse_block_elem(
                     .attr(ns::TEXT, "outline-level")
                     .and_then(|v| v.parse::<u8>().ok())
                     .unwrap_or(1);
-                let (inlines, boxes) = parse_inline_content(elem, ctx)?;
+                let base = paragraph_base(elem, ctx)?;
+                let (inlines, boxes) = parse_inline_content(elem, ctx, base)?;
                 if !inlines_are_empty(&inlines) {
                     let mut content = inlines;
-                    rebase_emphasis(&mut content, paragraph_base(elem, ctx)?.resolve());
+                    rebase_emphasis(&mut content, base.resolve());
                     // ODF outline links target headings by their text; carry
                     // it as the heading's anchor id (without the number).
                     let anchor = Some(crate::model::inlines_to_plain_text(&content));
@@ -110,11 +111,14 @@ fn parse_block_elem(
                 // the paragraph style chain same as bold): the paragraph
                 // contributes nothing, not even as an empty placeholder,
                 // and the surrounding run of same-styled paragraphs treats
-                // it as if it were never there.
-                if paragraph_base(elem, ctx)?.hidden == Some(true) {
+                // it as if it were never there. `base` is resolved once and
+                // passed to `parse_inline_content` rather than re-resolved
+                // there.
+                let base = paragraph_base(elem, ctx)?;
+                if base.hidden == Some(true) {
                     return Ok(());
                 }
-                let (inlines, boxes) = parse_inline_content(elem, ctx)?;
+                let (inlines, boxes) = parse_inline_content(elem, ctx, base)?;
                 let style =
                     elem.attr(ns::TEXT, "style-name").and_then(|n| ctx.styles.block_style(n));
                 match style {
@@ -340,12 +344,16 @@ fn heading_label(elem: &Element, level: u8, ctx: &Ctx) -> Option<String> {
 }
 
 /// Inline content of a paragraph plus block attachments (text boxes) that
-/// were anchored in it.
+/// were anchored in it. `base` is the paragraph's already-resolved style
+/// chain - callers that need it anyway (the `hidden` check on the "h"/"p"
+/// arms above) pass it in rather than have it resolved a second time here;
+/// the `hidden` check is kept regardless as a guard for any future caller
+/// that does not.
 fn parse_inline_content(
     elem: &Element,
     ctx: &Ctx,
+    base: StyleDelta,
 ) -> Result<(Vec<Inline>, Vec<Block>), ConvertError> {
-    let base = paragraph_base(elem, ctx)?;
     if base.hidden == Some(true) {
         return Ok((Vec::new(), Vec::new()));
     }

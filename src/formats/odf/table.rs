@@ -10,11 +10,13 @@
 //!
 //! A row with `table:visibility="collapse"` (grouped/outlined) or `"filter"`
 //! (AutoFilter) is author-hidden and dropped outright - repeats included,
-//! and before it is charged against the expansion budget. `table:column`
-//! carries the same attribute, but this module has no column-to-cell index
-//! to hide the corresponding cells through, so hidden columns are not
-//! currently handled (their cells still render); see the parse module's
-//! notes for what that would take.
+//! and before it is charged against the expansion budget. A whole
+//! `table:table-row-group` with `table:display="false"` (ODF 1.2 §19.615)
+//! is dropped the same way. `table:column` carries the row's `visibility`
+//! attribute too, but this module has no column-to-cell index to hide the
+//! corresponding cells through, so hidden columns are not currently handled
+//! (their cells still render); see the parse module's notes for what that
+//! would take.
 
 use crate::error::ConvertError;
 use crate::formats::odf::text::{Ctx, parse_container};
@@ -203,6 +205,11 @@ fn walk_rows(
                 if top && state.header_rows == 0 {
                     state.header_rows = state.rows_emitted - before;
                 }
+            }
+            "table-row-group" if child.attr(ns::TABLE, "display") == Some("false") => {
+                // A whole hidden row group (ODF 1.2 SS19.615
+                // `table:display="false"` on `table:table-row-group`):
+                // dropped the same way as an individually hidden row.
             }
             "table-rows" | "table-row-group" => walk_rows(child, ctx, state, false)?,
             "table-row" => {

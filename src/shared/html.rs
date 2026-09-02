@@ -9,28 +9,43 @@
 //!
 //! Author-hidden content is dropped, with no option to keep it: `display:
 //! none`, `visibility: hidden`/`collapse`, `opacity: 0` (numeric zero in any
-//! form, `0%` included though not valid CSS), `font-size: 0` (any unit), the
-//! `hidden` attribute (a boolean attribute - any value hides, including
-//! `hidden="until-found"`), and `aria-hidden="true"` (case-insensitive). The
-//! four CSS triggers are tracked as independent tri-states in [`StyleProps`]
-//! and merged independently through the cascade, so a declaration only
-//! cancels its own property's hide: `font-size: 0; display: inline` and
-//! `opacity: 0; display: block` both still hide (a later/higher-priority
-//! `display` cannot undo a `font-size`/`opacity`/`visibility` hide, and vice
-//! versa) - only `display: <not none>` cancels a prior `display: none`,
-//! only `visibility: visible` cancels a prior `visibility: hidden`, and only
-//! a non-zero `opacity`/`font-size` cancels a prior zero one. A hidden
+//! form, `0%` included though not valid CSS), `font-size: 0` (any unit, and
+//! the `font` shorthand's size component), the `hidden` attribute (a boolean
+//! attribute - any value hides, including `hidden="until-found"`), and
+//! `aria-hidden="true"` (case-insensitive). The four CSS triggers are
+//! tracked as independent tri-states in [`StyleProps`] and merged
+//! independently through the cascade, so a declaration only cancels its own
+//! property's hide: `font-size: 0; display: inline` and `opacity: 0;
+//! display: block` both still hide (a later/higher-priority `display`
+//! cannot undo a `font-size`/`opacity`/`visibility` hide, and vice versa) -
+//! only `display: <not none>` cancels a prior `display: none`, only
+//! `visibility: visible` cancels a prior `visibility: hidden`, and only a
+//! non-zero `opacity`/`font-size` cancels a prior zero one. A hidden
 //! ancestor hides every descendant regardless of the descendant's own
 //! declarations - [`Builder::walk_elem`] returns before recursing once an
-//! element's own props resolve hidden, so a child's `display: block` never
-//! gets a chance to run (this includes `<body>` itself, checked by
-//! [`to_blocks`], and structural elements - `<li>`, `<tr>`,
-//! `<thead>`/`<tbody>`/`<tfoot>`, `<td>`/`<th>` - which are collected
-//! directly by [`Builder::parse_list`] and [`Builder::parse_table`] rather
-//! than through `walk_elem`, so those call sites re-check `element_props`
-//! themselves). A list item left with no blocks because its only content
-//! was hidden is dropped rather than kept as an empty marker; a genuinely
-//! empty `<li></li>` in the source is unaffected. White-on-white text and
+//! element's own `display`/`visibility`/`opacity`/attribute props resolve
+//! hidden, so a child's `display: block` never gets a chance to run (this
+//! includes `<body>` itself, checked by [`to_blocks`], and structural
+//! elements - `<li>`, `<tr>`, `<thead>`/`<tbody>`/`<tfoot>`, `<td>`/`<th>`,
+//! `<caption>` - which are collected directly by [`Builder::parse_list`] and
+//! [`Builder::walk_elem`]'s `"table"` arm rather than through the general
+//! recursion, so those call sites re-check `element_props` themselves).
+//!
+//! `font-size: 0` is the one hiding trigger that does *not* work this way,
+//! because unlike the others it is an ordinarily-inherited, resettable CSS
+//! property with a legitimate visible use (`ul { font-size: 0 } li {
+//! font-size: 16px }`, the classic inline-block whitespace-removal hack): a
+//! zero font-size on a container must not blank out a descendant that
+//! resets it. So `font_size_zero` is threaded through [`Inherited`] as an
+//! effective, inheritable state alongside the style delta rather than
+//! folded into `props.hidden`/the early return, and only [`Builder::push_text`]
+//! consults it - a text node is dropped when its *effective* font-size
+//! resolves to zero, while everything else (an `<img>`, table structure, …)
+//! is unaffected by font-size.
+//!
+//! A list item left with no blocks because its only content was hidden is
+//! dropped rather than kept as an empty marker; a genuinely empty
+//! `<li></li>` in the source is unaffected. White-on-white text and
 //! off-page positioning are out of scope: not reliably detectable from
 //! markup alone. A closed (non-`open`) `<details>` is left as-is - its body
 //! is a UI click away, not author-hidden content, so it still renders.
@@ -72,7 +87,8 @@ pub fn to_blocks(
     if body_props.hidden {
         return Ok(Vec::new());
     }
-    builder.walk_children(body, StyleDelta::default().merge(body_props.delta))?;
+    let inherited = Inherited::default().merge(body_props);
+    builder.walk_children(body, inherited)?;
     Ok(builder.finish())
 }
 
@@ -119,6 +135,36 @@ impl StyleProps {
             && self.visibility_hidden.is_none()
             && self.opacity_zero.is_none()
             && self.font_size_zero.is_none()
+    }
+}
+
+/// What [`Builder`] threads down through recursion: the style delta plus the
+/// ancestor chain's effective `font-size: 0` state. `font-size` is an
+/// ordinarily-inherited CSS property with a legitimate visible use
+/// (`container { font-size: 0 } item { font-size: 16px }`), so unlike the
+/// blanket hiding triggers folded into [`StyleProps::hidden`] it cannot be
+/// handled by an early return in [`Builder::walk_elem`] - a descendant's own
+/// `font-size` must be able to cancel an ancestor's zero one. Instead each
+/// element's own declaration (if any) overrides the inherited value, and
+/// only [`Builder::push_text`] consults the result - text is dropped when
+/// its *effective* font-size resolves to zero, while non-text content
+/// (`<img>`, table structure, …) is unaffected either way.
+#[derive(Debug, Clone, Copy, Default)]
+struct Inherited {
+    delta: StyleDelta,
+    font_size_zero: bool,
+}
+
+impl Inherited {
+    /// Merge one element's own resolved [`StyleProps`] into the ancestor
+    /// state: `delta` merges as it always has, and `font_size_zero`
+    /// inherits from the ancestor unless this element declared its own
+    /// `font-size` (zero or not).
+    fn merge(self, props: StyleProps) -> Inherited {
+        Inherited {
+            delta: self.delta.merge(props.delta),
+            font_size_zero: props.font_size_zero.unwrap_or(self.font_size_zero),
+        }
     }
 }
 
@@ -277,6 +323,20 @@ fn parse_declarations(body: &str) -> DeclProps {
                     props.font_size_zero = Some(zero);
                 }
             }
+            "font" => {
+                // The `font` shorthand's size is whichever token is
+                // numeric (optionally with a `/line-height` suffix, e.g.
+                // `font: 0/0 a`): the preceding `style`/`variant`/`weight`
+                // keywords and the trailing font-family aren't, so the
+                // first token that parses as a number is the size.
+                for token in value.split_whitespace() {
+                    let size = token.split('/').next().unwrap_or(token);
+                    if let Some(zero) = numeric_is_zero(size) {
+                        props.font_size_zero = Some(zero);
+                        break;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -366,9 +426,9 @@ impl Builder<'_> {
     fn sub_blocks(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
     ) -> Result<Vec<Block>, ConvertError> {
-        self.sub_blocks_at(elem, delta, true)
+        self.sub_blocks_at(elem, inherited, true)
     }
 
     /// Sub-walk starting at the given whitespace-boundary state (`false`
@@ -377,7 +437,7 @@ impl Builder<'_> {
     fn sub_blocks_at(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
         start_boundary: bool,
     ) -> Result<Vec<Block>, ConvertError> {
         let mut b = Builder {
@@ -387,7 +447,7 @@ impl Builder<'_> {
             ctx: self.ctx,
             start_boundary,
         };
-        b.walk_children(elem, delta)?;
+        b.walk_children(elem, inherited)?;
         Ok(b.finish())
     }
 
@@ -408,14 +468,17 @@ impl Builder<'_> {
         for (_, entry) in entries {
             props = props.merge(entry);
         }
-        // Fold the four independent triggers into one decision: any of them
-        // resolving true hides, and only that same property's own opposite
-        // value (handled above, per declaration) can cancel it - a
-        // `display: block` cannot cancel a `font-size: 0` hide, etc.
+        // Fold three of the four triggers into one blanket decision: any of
+        // them resolving true hides the whole subtree, and only that same
+        // property's own opposite value (handled above, per declaration)
+        // can cancel it - a `display: block` cannot cancel an `opacity: 0`
+        // hide, etc. `font_size_zero` deliberately stays out of this fold
+        // (and so out of the early-return in `walk_elem`): it is an
+        // inherited, resettable property, not a blanket subtree hide - see
+        // the module docs and [`Inherited`].
         props.hidden = props.display_none == Some(true)
             || props.visibility_hidden == Some(true)
-            || props.opacity_zero == Some(true)
-            || props.font_size_zero == Some(true);
+            || props.opacity_zero == Some(true);
         // The `hidden` attribute (a boolean attribute: any value, including
         // `hidden="until-found"`, hides) and `aria-hidden="true"`
         // (case-insensitively; HTML enumerated attribute values are ASCII
@@ -432,6 +495,21 @@ impl Builder<'_> {
         props
     }
 
+    /// Fold one element's own resolved props into the ancestor-inherited
+    /// state: cascade order is inherited delta, then the tag's
+    /// presentational default (`<b>`, `<i>`, …), then this element's CSS -
+    /// so `font-weight: normal` can undo a `<b>` - while `font_size_zero`
+    /// inherits unless this element declared its own `font-size` (see
+    /// [`Inherited`]). Shared by [`Builder::walk_elem`] and the directly
+    /// collected `<caption>` (which does not otherwise go through
+    /// `walk_elem`).
+    fn merge_props(&self, elem: &Element, inherited: Inherited, props: StyleProps) -> Inherited {
+        Inherited {
+            delta: merge_inline_tag(elem, inherited.delta).merge(props.delta),
+            font_size_zero: props.font_size_zero.unwrap_or(inherited.font_size_zero),
+        }
+    }
+
     fn push_anchor(&mut self, elem: &Element) {
         if let Some(id) = elem.attr_any("id").filter(|i| !i.is_empty()) {
             self.inlines.push(Inline::Anchor(self.ctx.anchor_id(id)));
@@ -443,17 +521,23 @@ impl Builder<'_> {
         }
     }
 
-    fn walk_children(&mut self, elem: &Element, delta: StyleDelta) -> Result<(), ConvertError> {
+    fn walk_children(&mut self, elem: &Element, inherited: Inherited) -> Result<(), ConvertError> {
         for node in &elem.children {
             match node {
-                Node::Text(t) => self.push_text(t, delta),
-                Node::Elem(e) => self.walk_elem(e, delta)?,
+                Node::Text(t) => self.push_text(t, inherited),
+                Node::Elem(e) => self.walk_elem(e, inherited)?,
             }
         }
         Ok(())
     }
 
-    fn push_text(&mut self, text: &str, delta: StyleDelta) {
+    fn push_text(&mut self, text: &str, inherited: Inherited) {
+        // `font-size: 0` (directly declared, or inherited from an ancestor
+        // that never had it reset) blanks only the text itself - see the
+        // module docs and [`Inherited`].
+        if inherited.font_size_zero {
+            return;
+        }
         let collapsed = collapse_ws(&clean_text(text));
         if collapsed.is_empty() {
             return;
@@ -469,26 +553,23 @@ impl Builder<'_> {
         if text.is_empty() {
             return;
         }
-        self.inlines.push(Inline::Text { text, style: delta.resolve() });
+        self.inlines.push(Inline::Text { text, style: inherited.delta.resolve() });
     }
 
-    fn walk_elem(&mut self, elem: &Element, delta: StyleDelta) -> Result<(), ConvertError> {
+    fn walk_elem(&mut self, elem: &Element, inherited: Inherited) -> Result<(), ConvertError> {
         let props = self.element_props(elem);
         if props.hidden {
             return Ok(());
         }
-        // Cascade order: inherited delta, then the tag's presentational
-        // default (`<b>`, `<i>`, …), then CSS — so `font-weight: normal`
-        // can undo a `<b>`.
-        let delta = merge_inline_tag(elem, delta).merge(props.delta);
+        let inherited = self.merge_props(elem, inherited, props);
         match elem.local.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.flush_paragraph();
                 let level = elem.local[1..].parse::<u8>().unwrap_or(1);
-                let mut content = self.inline_children(elem, delta)?;
+                let mut content = self.inline_children(elem, inherited)?;
                 // The heading element's own styling is how it looks, not
                 // markup applied to the words; a `<b>` inside it still is.
-                rebase_emphasis(&mut content, delta.resolve());
+                rebase_emphasis(&mut content, inherited.delta.resolve());
                 let anchor = elem.attr_any("id").map(|id| self.ctx.anchor_id(id));
                 if !inlines_are_empty(&content) {
                     self.blocks.push(Block::Heading { level, anchor, content });
@@ -509,38 +590,47 @@ impl Builder<'_> {
                 self.flush_paragraph();
                 self.push_anchor(elem);
                 let mut content = std::mem::take(&mut self.inlines);
-                content.extend(self.inline_children(elem, delta)?);
+                content.extend(self.inline_children(elem, inherited)?);
                 if keeps_paragraph(&content) {
                     self.blocks.push(Block::Paragraph(content));
                 }
             }
             "ul" | "ol" => {
                 self.flush_paragraph();
-                let lists = self.parse_list(elem, delta)?;
+                let lists = self.parse_list(elem, inherited)?;
                 self.blocks.extend(lists);
             }
             "table" => {
                 self.flush_paragraph();
+                // Collected directly rather than through `walk_elem`, like
+                // the row/cell/group elements `parse_table` collects below -
+                // so its own hiding declarations need the same re-check
+                // `element_props` gives every other structural site.
                 if let Some(caption) = elem.child_elems().find(|e| e.local == "caption") {
-                    let content = self.inline_children(caption, delta)?;
-                    if keeps_paragraph(&content) {
-                        self.blocks.push(Block::Paragraph(content));
+                    let caption_props = self.element_props(caption);
+                    if !caption_props.hidden {
+                        let caption_inherited = self.merge_props(caption, inherited, caption_props);
+                        let content = self.inline_children(caption, caption_inherited)?;
+                        if keeps_paragraph(&content) {
+                            self.blocks.push(Block::Paragraph(content));
+                        }
                     }
                 }
-                if let Some(t) = self.parse_table(elem, delta)? {
+                if let Some(t) = self.parse_table(elem, inherited)? {
                     self.blocks.push(t);
                 }
             }
             "blockquote" => {
                 self.flush_paragraph();
-                let inner = self.sub_blocks(elem, delta)?;
+                let inner = self.sub_blocks(elem, inherited)?;
                 if !inner.is_empty() {
                     self.blocks.push(Block::BlockQuote(inner));
                 }
             }
             "pre" => {
                 self.flush_paragraph();
-                let text = elem.text();
+                let mut text = String::new();
+                self.collect_visible_text(elem, &mut text);
                 if !text.trim().is_empty() {
                     self.blocks.push(Block::CodeBlock { lang: None, text });
                 }
@@ -563,19 +653,36 @@ impl Builder<'_> {
                 self.push_anchor(elem);
                 if has_block_children(elem) {
                     self.flush_paragraph();
-                    self.walk_children(elem, delta)?;
+                    self.walk_children(elem, inherited)?;
                     self.flush_paragraph();
                 } else {
-                    self.walk_children(elem, delta)?;
+                    self.walk_children(elem, inherited)?;
                 }
             }
             "script" | "style" | "head" | "template" | "noscript" => {}
-            _ => self.walk_inline(elem, delta)?,
+            _ => self.walk_inline(elem, inherited)?,
         }
         Ok(())
     }
 
-    fn walk_inline(&mut self, elem: &Element, delta: StyleDelta) -> Result<(), ConvertError> {
+    /// Concatenated text of `elem`'s descendants, skipping any subtree whose
+    /// own element props resolve hidden - `<pre>` renders its text verbatim
+    /// rather than through [`Builder::push_text`], so it needs its own
+    /// hidden check instead of inheriting one for free.
+    fn collect_visible_text(&self, elem: &Element, out: &mut String) {
+        for node in &elem.children {
+            match node {
+                Node::Text(t) => out.push_str(t),
+                Node::Elem(e) => {
+                    if !self.element_props(e).hidden {
+                        self.collect_visible_text(e, out);
+                    }
+                }
+            }
+        }
+    }
+
+    fn walk_inline(&mut self, elem: &Element, inherited: Inherited) -> Result<(), ConvertError> {
         self.push_anchor(elem);
         match elem.local.as_str() {
             "br" => self.inlines.push(Inline::LineBreak),
@@ -594,7 +701,7 @@ impl Builder<'_> {
                 let target = elem.attr_any("href").and_then(|href| self.ctx.link_target(href));
                 let content = self.inline_children_at(
                     elem,
-                    delta,
+                    inherited,
                     at_space_boundary(&self.inlines, self.start_boundary),
                 )?;
                 // An empty label still keeps a resolved target: the renderer
@@ -604,7 +711,7 @@ impl Builder<'_> {
                     None => self.inlines.extend(content),
                 }
             }
-            _ => self.walk_children(elem, delta)?,
+            _ => self.walk_children(elem, inherited)?,
         }
         Ok(())
     }
@@ -612,19 +719,19 @@ impl Builder<'_> {
     fn inline_children(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
     ) -> Result<Vec<Inline>, ConvertError> {
-        self.inline_children_at(elem, delta, true)
+        self.inline_children_at(elem, inherited, true)
     }
 
     /// Inline children starting at the given whitespace-boundary state.
     fn inline_children_at(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
         start_boundary: bool,
     ) -> Result<Vec<Inline>, ConvertError> {
-        let mut blocks = self.sub_blocks_at(elem, delta, start_boundary)?;
+        let mut blocks = self.sub_blocks_at(elem, inherited, start_boundary)?;
         if blocks.len() == 1
             && let Block::Paragraph(inlines) = &mut blocks[0]
         {
@@ -651,7 +758,7 @@ impl Builder<'_> {
     fn parse_list(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
     ) -> Result<Vec<Block>, ConvertError> {
         let ordered = elem.local == "ol";
         let items: Vec<&Element> = elem
@@ -664,7 +771,7 @@ impl Builder<'_> {
         if !ordered {
             let mut list_items = Vec::with_capacity(items.len());
             for li in &items {
-                let blocks = self.sub_blocks(li, delta)?;
+                let blocks = self.sub_blocks(li, inherited)?;
                 // A visible `<li>` whose only content was itself dropped as
                 // hidden leaves no blocks; keep it out rather than render a
                 // bare marker for content that no longer exists. A source
@@ -709,7 +816,7 @@ impl Builder<'_> {
         if numbers.iter().any(|&n| n < 1) {
             let mut list_items = Vec::with_capacity(items.len());
             for (li, &n) in items.iter().zip(&numbers) {
-                let blocks = self.sub_blocks(li, delta)?;
+                let blocks = self.sub_blocks(li, inherited)?;
                 if blocks.is_empty() && li_had_content(li) {
                     continue;
                 }
@@ -724,8 +831,16 @@ impl Builder<'_> {
         let mut current: Option<List> = None;
         let mut last_number = 0i64;
         for (li, &number) in items.iter().zip(&numbers) {
-            let blocks = self.sub_blocks(li, delta)?;
-            let skip = blocks.is_empty() && li_had_content(li);
+            let blocks = self.sub_blocks(li, inherited)?;
+            if blocks.is_empty() && li_had_content(li) {
+                // A skipped item's source number must not leak into the
+                // surrounding run: it neither extends the current list (that
+                // would misnumber the next real item against a number that
+                // was never rendered) nor gets attached to one - the next
+                // surviving item starts a fresh run at its own true number,
+                // same as any other numbering discontinuity.
+                continue;
+            }
             let contiguous = current.is_some() && last_number.checked_add(1) == Some(number);
             if !contiguous {
                 if let Some(list) = current.take()
@@ -735,9 +850,7 @@ impl Builder<'_> {
                 }
                 current = Some(List { marker, start: number as u64, items: Vec::new() });
             }
-            if !skip {
-                current.as_mut().unwrap().items.push(ListItem { blocks, marker_label: None });
-            }
+            current.as_mut().unwrap().items.push(ListItem { blocks, marker_label: None });
             last_number = number;
         }
         if let Some(list) = current
@@ -751,7 +864,7 @@ impl Builder<'_> {
     fn parse_table(
         &mut self,
         elem: &Element,
-        delta: StyleDelta,
+        inherited: Inherited,
     ) -> Result<Option<Block>, ConvertError> {
         // (row, is thead row, row-group index): each thead/tbody/tfoot is
         // one row group; consecutive direct `tr` children form an implicit
@@ -827,7 +940,7 @@ impl Builder<'_> {
                     Some(n) => n.clamp(1, 65534),
                     None => 1,
                 };
-                let blocks = self.sub_blocks(cell, delta)?;
+                let blocks = self.sub_blocks(cell, inherited)?;
                 builder.place(Cell::spanning(blocks, col_span, row_span))?;
             }
             if i == header_rows && (*in_head || (all_th && any_cell)) {
@@ -1298,5 +1411,151 @@ mod tests {
         let out = blocks(html);
         let Block::Table(t) = &out[0] else { panic!("{out:?}") };
         assert_eq!(t.grid.len(), 1, "{t:?}");
+    }
+
+    #[test]
+    fn hidden_table_caption_is_dropped() {
+        // <caption> is collected directly (not through walk_elem), like the
+        // row/cell/group elements above - it needs the same hidden re-check.
+        let html = r#"<body><table>
+            <caption hidden="">CAPTION-HIDDEN-LEAK</caption>
+            <tr><td>x</td></tr>
+        </table></body>"#;
+        let out = blocks(html);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(&out[0], Block::Table(_)), "{out:?}");
+
+        let html = r#"<body><table>
+            <caption style="display: none">CAPTION-DISPLAYNONE-LEAK</caption>
+            <tr><td>x</td></tr>
+        </table></body>"#;
+        let out = blocks(html);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(&out[0], Block::Table(_)), "{out:?}");
+    }
+
+    #[test]
+    fn visible_table_caption_still_renders_as_a_paragraph() {
+        let html = r#"<body><table>
+            <caption>Table Title</caption>
+            <tr><td>x</td></tr>
+        </table></body>"#;
+        let out = blocks(html);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(para_text(&out[0]), "Table Title");
+        assert!(matches!(&out[1], Block::Table(_)), "{out:?}");
+    }
+
+    #[test]
+    fn pre_text_skips_hidden_descendants() {
+        let out =
+            blocks(r#"<body><pre>pre-visible <span hidden="">PRE-HIDDEN-LEAK</span></pre></body>"#);
+        let Block::CodeBlock { text, .. } = &out[0] else { panic!("{out:?}") };
+        assert!(!text.contains("PRE-HIDDEN-LEAK"), "{text:?}");
+        assert!(text.contains("pre-visible"), "{text:?}");
+    }
+
+    #[test]
+    fn font_shorthand_zero_size_drops_content() {
+        let out = blocks(r#"<body><p style="font: 0/0 a">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn font_shorthand_with_nonzero_size_keeps_content() {
+        let out = blocks(r#"<body><p style="font: 12px/1.4 serif">x</p></body>"#);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(para_text(&out[0]), "x");
+    }
+
+    #[test]
+    fn opacity_and_font_size_zero_from_a_style_rule_by_class() {
+        for prop in ["opacity: 0", "font-size: 0"] {
+            let css = format!(".h {{ {prop} }}");
+            let out = blocks_with_css(r#"<body><p class="h">x</p><p>y</p></body>"#, &css);
+            assert_eq!(out.len(), 1, "{prop}: {out:?}");
+            assert_eq!(para_text(&out[0]), "y", "{prop}");
+        }
+    }
+
+    #[test]
+    fn font_size_zero_container_does_not_hide_a_child_that_resets_it() {
+        // `font-size: 0` on a container followed by a non-zero reset on a
+        // descendant is a common visible pattern (the classic `ul.ib {
+        // font-size: 0 } ul.ib li { font-size: 16px }` inline-block
+        // whitespace-removal hack, among others); unlike
+        // display/visibility/opacity, font-size is an ordinary inherited
+        // CSS property, so a descendant's own value cancels the ancestor's
+        // zero instead of the whole subtree being blanket-hidden as it used
+        // to be. (The supported CSS subset has no descendant combinator, so
+        // this exercises the same cascade with a `<div>`/`<p>` pair instead
+        // of `ul`/`li`.)
+        let out = blocks(
+            r#"<body><div style="font-size: 0">
+                <p style="font-size: 16px">IB-VISIBLE-ITEM-ONE</p>
+                <p style="font-size: 16px">IB-VISIBLE-ITEM-TWO</p>
+            </div></body>"#,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(para_text(&out[0]), "IB-VISIBLE-ITEM-ONE");
+        assert_eq!(para_text(&out[1]), "IB-VISIBLE-ITEM-TWO");
+    }
+
+    #[test]
+    fn font_size_zero_hides_only_text_that_does_not_reset_it() {
+        let html = r#"<body><p style="font-size: 0">gone <span style="font-size: 16px">kept</span></p></body>"#;
+        let out = blocks(html);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(para_text(&out[0]), "kept");
+    }
+
+    #[test]
+    fn font_size_zero_does_not_hide_non_text_content() {
+        // Replaced content (an image) is unaffected by font-size either way.
+        let html = r#"<body><p style="font-size: 0"><img src="a.png" alt="pic"></p></body>"#;
+        let out = blocks(html);
+        let Block::Paragraph(inlines) = &out[0] else { panic!("{out:?}") };
+        assert!(inlines.iter().any(|i| matches!(i, Inline::Image { .. })), "{inlines:?}");
+    }
+
+    #[test]
+    fn skipped_ordered_list_item_does_not_shift_following_numbers() {
+        // A middle item emptied entirely by hidden content must not steal a
+        // number that renumbers the surviving items after it: the skipped
+        // item is a discontinuity, so "three" starts a fresh run at its own
+        // true source number (3) rather than landing at 2.
+        let out = blocks(
+            r#"<body><ol>
+                <li>one</li>
+                <li><span hidden="">gone</span></li>
+                <li>three</li>
+            </ol></body>"#,
+        );
+        let starts_and_text: Vec<(u64, String)> = out
+            .iter()
+            .map(|b| {
+                let Block::List(l) = b else { panic!("{out:?}") };
+                (l.start, block_text(&l.items[0].blocks[0]))
+            })
+            .collect();
+        assert_eq!(
+            starts_and_text,
+            vec![(1, "one".to_string()), (3, "three".to_string())],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn skipped_first_ordered_list_item_does_not_lower_the_next_items_number() {
+        let out = blocks(
+            r#"<body><ol>
+                <li><span hidden="">gone</span></li>
+                <li>two</li>
+            </ol></body>"#,
+        );
+        let Block::List(list) = &out[0] else { panic!("{out:?}") };
+        assert_eq!(list.start, 2, "{list:?}");
+        assert_eq!(block_text(&list.items[0].blocks[0]), "two");
     }
 }
