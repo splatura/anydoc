@@ -1,7 +1,10 @@
 //! OOXML WordprocessingML (.docx / .docm).
 //!
 //! Resolution pipeline: package parts -> style/numbering models ->
-//! spec-order property resolution -> document model.
+//! spec-order property resolution -> document model. Author-hidden text
+//! (`w:vanish`/`w:webHidden`, resolved through the same style cascade as
+//! bold/italic/strike) and tracked deletions (`w:del`) are omitted from the
+//! model entirely, with no option to retain them.
 
 mod content;
 mod numbering;
@@ -329,5 +332,282 @@ mod tests {
             })
             .collect();
         assert_eq!(headings, vec!["1. Intro", "2. Details"]);
+    }
+
+    #[test]
+    fn direct_vanish_run_is_dropped_while_neighbours_survive() {
+        // Author-hidden text is omitted from the model entirely, the same
+        // way DOCX already drops w:del tracked deletions.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r>
+            <w:r><w:t> after</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"), "{text:?}");
+        assert!(text.contains("after"), "{text:?}");
+    }
+
+    #[test]
+    fn direct_web_hidden_run_is_dropped() {
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"), "{text:?}");
+    }
+
+    #[test]
+    fn character_style_vanish_hides_its_runs() {
+        // Hidden must resolve through the style cascade like bold does: a
+        // character style carrying w:vanish hides the runs that use it.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:rStyle w:val="Hidden"/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"), "{text:?}");
+    }
+
+    #[test]
+    fn direct_vanish_off_under_a_hidden_style_is_kept() {
+        // A run's direct rPr with <w:vanish w:val="0"/> un-hides even when
+        // its character style is hidden.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Hidden"/><w:vanish w:val="0"/></w:rPr>
+                <w:t>visible</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
+    fn a_paragraph_of_only_hidden_runs_produces_no_empty_paragraph() {
+        let document = format!(
+            r#"<w:document {W}><w:body>
+            <w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>gone</w:t></w:r></w:p>
+            <w:p><w:r><w:t>kept</w:t></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "kept");
+    }
+
+    #[test]
+    fn paragraph_style_vanish_hides_runs_with_no_direct_rpr() {
+        // Hidden must also cascade from a *paragraph* style, not only a
+        // character style: a run with no rPr of its own still hides when
+        // its paragraph uses a w:pStyle carrying w:vanish.
+        let document = format!(
+            r#"<w:document {W}><w:body>
+            <w:p><w:pPr><w:pStyle w:val="HiddenPara"/></w:pPr>
+                <w:r><w:t>secret</w:t></w:r></w:p>
+            <w:p><w:r><w:t>kept</w:t></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="paragraph" w:styleId="HiddenPara">
+                <w:rPr><w:vanish/></w:rPr>
+            </w:style></w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert_eq!(doc.blocks.len(), 1, "hidden paragraph must not survive: {:?}", doc.blocks);
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "kept");
+    }
+
+    #[test]
+    fn doc_defaults_vanish_hides_runs_with_no_style_or_direct_rpr() {
+        // docDefaults' rPr is the base every toggle parity flips over; a
+        // vanish there hides a run that specifies no rPr at all.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert!(doc.blocks.is_empty(), "{:?}", doc.blocks);
+    }
+
+    #[test]
+    fn based_on_vanish_cancels_between_parent_and_child_style() {
+        // w:vanish is a toggle property: two true specifications along the
+        // basedOn chain cancel back to visible, the same parity rule as
+        // bold/italic/strike.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Child"/></w:rPr><w:t>visible</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Child">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph, hidden text cancelled back to visible: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
+    fn based_on_vanish_cascades_through_a_three_level_chain() {
+        // Regression test for the cascade actually propagating: unlike
+        // `based_on_vanish_cancels_between_parent_and_child_style` (where
+        // vanish/vanish cancel back to visible even without the feature),
+        // this chain has an odd number of `w:vanish` specifications so the
+        // run must resolve hidden - the parity assertion only holds if
+        // hidden keeps cascading through more than one basedOn hop.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Leaf"/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Middle">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            <w:style w:type="character" w:styleId="Leaf">
+                <w:basedOn w:val="Middle"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert!(doc.blocks.is_empty(), "hidden text must not survive: {:?}", doc.blocks);
+    }
+
+    #[test]
+    fn character_style_web_hidden_hides_its_runs() {
+        // w:webHidden is absolute, not an ECMA-376 toggle, but it must
+        // still cascade through a character style like vanish does.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:rStyle w:val="WebHidden"/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="WebHidden"><w:rPr><w:webHidden/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"), "{text:?}");
+    }
+
+    #[test]
+    fn nearer_web_hidden_specification_wins_over_an_ancestor_style() {
+        // w:webHidden is absolute last-wins along basedOn, not XOR parity:
+        // a child style's explicit off must un-hide even though its parent
+        // specifies webHidden, and direct formatting still overrides both.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Child"/></w:rPr><w:t>visible</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:webHidden/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Child">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:webHidden w:val="0"/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph, nearer webHidden=0 must win: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
+    fn hidden_fld_char_separate_does_not_drop_the_visible_field_result() {
+        // A field's structural markers (w:fldChar/w:instrText) must still
+        // be walked even when the marker's own run is hidden: a hidden
+        // "separate" that never flips in_result would leave every visible
+        // result run discarded until "end".
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> HYPERLINK "https://example.com" </w:instrText></w:r>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>link text</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(text.contains("link text"), "{text:?}");
     }
 }

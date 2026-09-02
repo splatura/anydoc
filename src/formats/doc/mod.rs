@@ -2,7 +2,11 @@
 //! algorithms: OLE2 container, FIB, piece table with `Prm`s, CHPX/PAPX runs
 //! applied over the STSH style chains in specification order, and the
 //! PlfLst/PlfLfo list tables. Character positions are counted in UTF-16
-//! units, matching the CP-indexed PLC structures.
+//! units, matching the CP-indexed PLC structures. Hidden text
+//! (`sprmCFVanish`) and text marked for deletion by revision tracking
+//! (`sprmCFRMarkDel`) resolve through the same style-chain toggles as
+//! bold/italic/strike and are omitted from the model entirely, with no
+//! option to retain them.
 
 mod lists;
 mod sprm;
@@ -23,7 +27,7 @@ use crate::shared::grid::{CellProp, GridRow, build_edge_table};
 use crate::shared::list::MarkerKind;
 use crate::shared::list::{ListEntry, ListKey, flush_list};
 use lists::{LEVELS, ListDef, Lists};
-use sprm::{PapDelta, Tap, apply_chpx, apply_pap_sprms, chpx_istd};
+use sprm::{Chp, PapDelta, Tap, apply_chpx, apply_pap_sprms, chpx_istd};
 use std::collections::HashMap;
 use std::io::Cursor;
 use stsh::Stylesheet;
@@ -248,9 +252,13 @@ fn prm0_grpprl(prm: u16) -> Option<Vec<u8>> {
         0x0C => 0x260A, // sprmPIlvl
         0x18 => 0x2416, // sprmPFInTable
         0x19 => 0x2417, // sprmPFTtp
+        0x41 => 0x0800, // sprmCFRMarkDel
+        0x50 => 0x0811, // sprmCFWebHidden
+        0x51 => 0x0818, // sprmCFSpecVanish
         0x55 => 0x0835, // sprmCFBold
         0x56 => 0x0836, // sprmCFItalic
         0x57 => 0x0837, // sprmCFStrike
+        0x5C => 0x083C, // sprmCFVanish
         0x78 => 0x2640, // sprmPOutLvl
         _ => return None,
     };
@@ -706,7 +714,12 @@ impl Assembler {
             let c = self.text.chars[i];
             let fc = self.text.fcs[i];
             if let Some(id) = self.note_refs.get(&i) {
-                para.push_inline(Inline::NoteRef(id.clone()));
+                // A hidden run's footnote/endnote reference is dropped with
+                // it, the same as its text.
+                let (_, hidden) = self.char_style(fc, i);
+                if !hidden {
+                    para.push_inline(Inline::NoteRef(id.clone()));
+                }
                 i += 1;
                 continue;
             }
@@ -775,25 +788,33 @@ impl Assembler {
                 '\u{14}' => para.field_separate(),
                 '\u{15}' => para.field_end(),
                 '\t' => {
-                    let style = self.char_style(fc, i);
-                    para.push_char(' ', style);
+                    let (style, hidden) = self.char_style(fc, i);
+                    if !hidden {
+                        para.push_char(' ', style);
+                    }
                 }
                 '\u{1e}' => {
-                    let style = self.char_style(fc, i);
-                    para.push_char('-', style);
+                    let (style, hidden) = self.char_style(fc, i);
+                    if !hidden {
+                        para.push_char('-', style);
+                    }
                 }
                 // Inline picture special character: extract the payload
-                // pointed at by sprmCPicLocation.
+                // pointed at by sprmCPicLocation. Hidden with its run, the
+                // same as its text.
                 '\u{1}' => {
-                    if let Some(image) = self.picture_at(fc)? {
+                    let (_, hidden) = self.char_style(fc, i);
+                    if !hidden && let Some(image) = self.picture_at(fc)? {
                         para.push_inline(image);
                     }
                 }
                 '\u{2}' | '\u{5}' | '\u{8}' | '\u{1f}' => {}
                 c if c.is_control() => {}
                 c => {
-                    let style = self.char_style(fc, i);
-                    para.push_char(c, style);
+                    let (style, hidden) = self.char_style(fc, i);
+                    if !hidden {
+                        para.push_char(c, style);
+                    }
                 }
             }
             i += 1;
@@ -812,19 +833,23 @@ impl Assembler {
     }
 
     /// Effective character style in specification order: paragraph/character
-    /// style chain -> CHPX (toggles vs the style base) -> piece Prm.
-    fn char_style(&self, fc: u32, char_index: usize) -> Style {
+    /// style chain -> CHPX (toggles vs the style base) -> piece Prm. Returns
+    /// the resolved style alongside the hidden state
+    /// (`sprmCFVanish`/`sprmCFRMarkDel`), resolved the same way but never
+    /// reaching [`Style`].
+    fn char_style(&self, fc: u32, char_index: usize) -> (Style, bool) {
         let para_istd = self.papx.lookup(fc).map(|p| p.istd).unwrap_or(0);
         let chpx = self.chpx.lookup(fc).map(|p| p.chpx.as_slice()).unwrap_or(&[]);
         let istd = chpx_istd(chpx).unwrap_or(para_istd);
-        let base = self.stylesheet.get(istd).chp;
-        let mut style = apply_chpx(chpx, base, base);
+        let resolved = self.stylesheet.get(istd);
+        let base = Chp { style: resolved.chp, hidden: resolved.chp_hidden };
+        let mut chp = apply_chpx(chpx, base, base);
         if let Some(&piece_idx) = self.text.piece_of.get(char_index)
             && let Some(piece_prc) = self.piece_prm(piece_idx as usize)
         {
-            style = apply_chpx(piece_prc, style, base);
+            chp = apply_chpx(piece_prc, chp, base);
         }
-        style
+        (chp.style, chp.hidden)
     }
 
     fn piece_prm(&self, piece_idx: usize) -> Option<&[u8]> {
@@ -1055,6 +1080,13 @@ mod tests {
     use crate::shared::numbering::NumberText;
     use lists::LevelDef;
 
+    // This module has no inline builder that assembles a full OLE2/FIB/PLC
+    // `WordDocument` stream byte-for-byte, so the hidden/deleted-revision
+    // behaviour added alongside this comment has no end-to-end .doc test
+    // here; it is covered at the `apply_chpx`/`prm0_grpprl` unit level in
+    // `sprm.rs` and above, which exercise the exact toggle-resolution and
+    // Prm0-decoding logic the end-to-end path depends on.
+
     fn list(lsid: u32) -> ListDef {
         let mut levels: [LevelDef; LEVELS] = std::array::from_fn(|_| LevelDef::default());
         levels[0].marker = Some(MarkerKind::Decimal);
@@ -1145,6 +1177,20 @@ mod tests {
         assert_eq!(prm0_grpprl(prm), Some(vec![0x16, 0x24, 0x01]));
         // isprm 0x05 (sprmPJc) is outside the converted model.
         assert_eq!(prm0_grpprl(0x05 << 1), None);
+    }
+
+    #[test]
+    fn prm0_decodes_hidden_and_deleted_toggles() {
+        // isprm 0x5C = sprmCFVanish (0x083C): the fast-save path must hide
+        // text the same way a full CHPX grpprl does.
+        let prm = (0x5Cu16 << 1) | (0x01 << 8);
+        assert_eq!(prm0_grpprl(prm), Some(vec![0x3C, 0x08, 0x01]));
+        // isprm 0x41 = sprmCFRMarkDel (0x0800).
+        let prm = (0x41u16 << 1) | (0x01 << 8);
+        assert_eq!(prm0_grpprl(prm), Some(vec![0x00, 0x08, 0x01]));
+        // isprm 0x3F is not defined in the Prm0 table; it must stay a no-op
+        // rather than being mistaken for sprmCFRMarkDel.
+        assert_eq!(prm0_grpprl(0x3F << 1), None);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! WordprocessingML style table.
 //!
-//! Bold/italic/strike are *toggle properties* (ECMA-376 §17.7.3): within the
-//! style hierarchy a `true` specification toggles the inherited value and a
-//! `false` specification leaves it unchanged, so the style layers contribute
-//! a true-count *parity* XORed over the `docDefaults` base. Direct run
-//! formatting is absolute on/off.
+//! Bold/italic/strike/vanish are *toggle properties* (ECMA-376 §17.7.3):
+//! within the style hierarchy a `true` specification toggles the inherited
+//! value and a `false` specification leaves it unchanged, so the style
+//! layers contribute a true-count *parity* XORed over the `docDefaults`
+//! base. Direct run formatting is absolute on/off. Vanish (and `webHidden`,
+//! for direct formatting) resolves the same way but never reaches [`Style`]:
+//! it is consulted separately, and text that resolves hidden is omitted.
 
 use crate::error::ConvertError;
 use crate::model::Style;
@@ -19,6 +21,23 @@ pub struct Toggles {
     pub bold: bool,
     pub italic: bool,
     pub strike: bool,
+    /// `w:vanish` (ECMA-376 §17.7.3 toggle property). Unlike bold/italic/
+    /// strike this never reaches [`Style`] - it is consulted separately so a
+    /// hidden style can hide the runs that use it.
+    pub hidden: bool,
+    /// `w:webHidden`'s nearest explicit specification along the `basedOn`
+    /// chain (child wins), separately from `hidden`'s XOR parity.
+    ///
+    /// Deliberately not folded into `hidden`'s parity: `w:webHidden` is not
+    /// an ECMA-376 toggle property (it has no defined behavior when
+    /// repeated down a `basedOn` chain), so XORing it the way `strike`/
+    /// `dstrike` are combined would make two `<w:webHidden/>`
+    /// specifications along the chain cancel each other back to visible -
+    /// an absolute property masquerading as a toggle. Instead the nearest
+    /// specification wins, the same absolute-last-wins semantics
+    /// `rpr_delta` already gives direct formatting, and [`Toggles::hidden_over`]
+    /// ORs it into the resolved hidden state.
+    pub web_hidden: Option<bool>,
 }
 
 impl Toggles {
@@ -27,6 +46,10 @@ impl Toggles {
             bold: self.bold ^ other.bold,
             italic: self.italic ^ other.italic,
             strike: self.strike ^ other.strike,
+            hidden: self.hidden ^ other.hidden,
+            // Not a toggle; resolved separately by `run_toggles` (nearest
+            // explicit specification wins) and carried through unchanged.
+            web_hidden: self.web_hidden,
         }
     }
 
@@ -38,19 +61,33 @@ impl Toggles {
             code: base.code,
         }
     }
+
+    /// The style chain's hidden parity flipped over `base`, ORed with the
+    /// nearest explicit `web_hidden` specification - the sibling of
+    /// [`Toggles::apply_over`] for the property [`Style`] has no room for.
+    pub fn hidden_over(self, base: bool) -> bool {
+        (base ^ self.hidden) || self.web_hidden == Some(true)
+    }
 }
 
 pub struct Styles<'a> {
     chains: StyleChains<'a, Element>,
     /// docDefaults as absolute values (the base the toggles flip over).
     pub doc_defaults: Style,
+    /// docDefaults' hidden state, alongside `doc_defaults` for the same
+    /// reason `Toggles` keeps `hidden` outside `Style`.
+    pub doc_defaults_hidden: bool,
 }
 
 impl<'a> Styles<'a> {
     pub fn parse_opt(root: Option<&'a Element>) -> Styles<'a> {
         match root {
             Some(root) => Styles::parse(root),
-            None => Styles { chains: StyleChains::default(), doc_defaults: Style::PLAIN },
+            None => Styles {
+                chains: StyleChains::default(),
+                doc_defaults: Style::PLAIN,
+                doc_defaults_hidden: false,
+            },
         }
     }
 
@@ -62,19 +99,23 @@ impl<'a> Styles<'a> {
                 chains.insert(id, style, parent);
             }
         }
-        let doc_defaults = root
+        let default_rpr = root
             .find(ns::W, "docDefaults")
             .and_then(|d| d.find(ns::W, "rPrDefault"))
-            .and_then(|d| d.find(ns::W, "rPr"))
-            .map(|rpr| rpr_delta(rpr).resolve())
-            .unwrap_or(Style::PLAIN);
-        Styles { chains, doc_defaults }
+            .and_then(|d| d.find(ns::W, "rPr"));
+        let default_delta = default_rpr.map(rpr_delta);
+        let doc_defaults = default_delta.map(|d| d.resolve()).unwrap_or(Style::PLAIN);
+        let doc_defaults_hidden = default_delta.and_then(|d| d.hidden).unwrap_or(false);
+        Styles { chains, doc_defaults, doc_defaults_hidden }
     }
 
     /// The parity of `true` toggle specifications along a style's `basedOn`
     /// chain. A `false` in a style leaves the inherited value unchanged.
     pub fn run_toggles(&self, id: &str) -> Result<Toggles, ConvertError> {
         let mut parity = Toggles::default();
+        // The nearest (child-most) explicit `w:webHidden`, absolute rather
+        // than XORed - see `Toggles::web_hidden`.
+        let mut web_hidden = None;
         self.chains.walk::<()>(id, |style| {
             if let Some(rpr) = style.find(ns::W, "rPr") {
                 parity = parity.xor(Toggles {
@@ -82,10 +123,16 @@ impl<'a> Styles<'a> {
                     italic: on_off(rpr, "i") == Some(true),
                     strike: on_off(rpr, "strike") == Some(true)
                         || on_off(rpr, "dstrike") == Some(true),
+                    hidden: on_off(rpr, "vanish") == Some(true),
+                    web_hidden: None,
                 });
+                if web_hidden.is_none() {
+                    web_hidden = on_off(rpr, "webHidden");
+                }
             }
             None
         })?;
+        parity.web_hidden = web_hidden;
         Ok(parity)
     }
 
@@ -175,6 +222,7 @@ impl<'a> Styles<'a> {
 /// formatting, where specifications are absolute on/off.
 pub fn rpr_delta(rpr: &Element) -> StyleDelta {
     let (s, d) = (on_off(rpr, "strike"), on_off(rpr, "dstrike"));
+    let (v, wh) = (on_off(rpr, "vanish"), on_off(rpr, "webHidden"));
     StyleDelta {
         bold: on_off(rpr, "b"),
         italic: on_off(rpr, "i"),
@@ -184,7 +232,11 @@ pub fn rpr_delta(rpr: &Element) -> StyleDelta {
             None
         },
         code: None,
-        hidden: None,
+        hidden: if v.is_some() || wh.is_some() {
+            Some(v.unwrap_or(false) || wh.unwrap_or(false))
+        } else {
+            None
+        },
     }
 }
 
