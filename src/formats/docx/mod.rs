@@ -4,7 +4,12 @@
 //! spec-order property resolution -> document model. Author-hidden text
 //! (`w:vanish`/`w:webHidden`, resolved through the same style cascade as
 //! bold/italic/strike) and tracked deletions (`w:del`) are omitted from the
-//! model entirely, with no option to retain them.
+//! model entirely, with no option to retain them. Hidden content never
+//! resolves to a leftover reference either: a hyperlink hidden down to an
+//! empty label drops out entirely (`content::InlineWalker`), and a
+//! footnote/endnote whose only reference sat in a hidden run is pruned from
+//! [`Document::notes`] below (`shared::notes::prune_hidden_notes`) so it
+//! cannot resurface as an unreferenced note at the document's end.
 
 mod content;
 mod numbering;
@@ -19,6 +24,7 @@ use crate::shared::assets::AssetSink;
 use content::Ctx;
 use numbering::Counters;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let pkg = match Package::open(bytes) {
@@ -60,6 +66,8 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
 
     let counters = RefCell::new(Counters::default());
     let assets = RefCell::new(AssetSink::new());
+    let dropped_notes = RefCell::new(HashSet::new());
+    let visible_notes = RefCell::new(HashSet::new());
 
     let footnotes_part =
         typed_part_path(&doc_rels, &main_part, rel_type::FOOTNOTES, "footnotes.xml");
@@ -73,6 +81,8 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         numbering: &numbering,
         counters: &counters,
         assets: &assets,
+        dropped_notes: &dropped_notes,
+        visible_notes: &visible_notes,
     };
     let blocks = content::parse_blocks(body, &ctx)?;
 
@@ -104,6 +114,12 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
             });
         }
     }
+
+    crate::shared::notes::prune_hidden_notes(
+        &mut notes,
+        &dropped_notes.borrow(),
+        &visible_notes.borrow(),
+    );
 
     let assets = std::mem::take(&mut assets.borrow_mut().assets);
     Ok(Document { blocks, notes, assets })
@@ -586,6 +602,98 @@ mod tests {
             panic!("expected a paragraph, nearer webHidden=0 must win: {:?}", doc.blocks)
         };
         assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
+    fn hidden_hyperlink_label_drops_the_link_while_a_visible_one_survives() {
+        // A hyperlink whose entire label is hidden must not resolve to a
+        // link at all: with no visible text, the renderer would otherwise
+        // show the raw target as the link text (`[target](target)`), which
+        // leaks a URL the author never displayed.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:hyperlink w:anchor="secret">
+                <w:r><w:rPr><w:vanish/></w:rPr><w:t>x</w:t></w:r>
+            </w:hyperlink>
+            <w:hyperlink w:anchor="visible"><w:r><w:t>click here</w:t></w:r></w:hyperlink>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let links: Vec<&Inline> =
+            inlines.iter().filter(|i| matches!(i, Inline::Link { .. })).collect();
+        assert_eq!(links.len(), 1, "{inlines:?}");
+        let Inline::Link { target, .. } = links[0] else { unreachable!() };
+        assert_eq!(*target, crate::model::LinkTarget::Anchor("visible".into()));
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains('x'), "{text:?}");
+        assert!(text.contains("click here"), "{text:?}");
+    }
+
+    #[test]
+    fn a_hyperlink_with_a_genuinely_empty_label_still_shows_its_target() {
+        // Pinning today's behaviour for the case the fix must not touch: an
+        // empty label the source itself wrote (no hidden content dropped)
+        // still keeps its resolved target, the way Word shows the URL.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:hyperlink w:anchor="target"></w:hyperlink>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&docx_parts(&[("word/document.xml", &document)])).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        assert!(
+            matches!(
+                inlines.as_slice(),
+                [Inline::Link { content, target }]
+                if content.is_empty() && *target == crate::model::LinkTarget::Anchor("target".into())
+            ),
+            "{inlines:?}"
+        );
+    }
+
+    fn footnotes_docx(document: &str, footnote_body: &str) -> Vec<u8> {
+        let footnotes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="1"><w:p><w:r><w:t>{footnote_body}</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        );
+        docx_parts(&[("word/document.xml", document), ("word/footnotes.xml", &footnotes)])
+    }
+
+    #[test]
+    fn a_footnote_referenced_only_from_hidden_content_is_dropped_entirely() {
+        // The reference mark itself is hidden, so Word never shows this
+        // footnote; its body must not survive as an unreferenced note either
+        // (the renderer appends unreferenced notes at the document's end).
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:footnoteReference w:id="1"/></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&footnotes_docx(&document, "HIDDEN-FOOTNOTE-BODY")).unwrap();
+        assert!(doc.notes.iter().all(|n| n.id != "fn1"), "{:?}", doc.notes);
+        let markdown = crate::render::markdown::document_to_markdown(&doc);
+        assert!(!markdown.contains("[^"), "{markdown:?}");
+        assert!(!markdown.contains("HIDDEN-FOOTNOTE-BODY"), "{markdown:?}");
+    }
+
+    #[test]
+    fn a_footnote_referenced_once_hidden_and_once_visibly_is_kept() {
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:footnoteReference w:id="1"/></w:r>
+            <w:r><w:t>seen</w:t></w:r>
+            <w:r><w:footnoteReference w:id="1"/></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&footnotes_docx(&document, "visible body")).unwrap();
+        assert!(doc.notes.iter().any(|n| n.id == "fn1"), "{:?}", doc.notes);
+        let markdown = crate::render::markdown::document_to_markdown(&doc);
+        assert!(markdown.contains("[^1]: visible body"), "{markdown:?}");
     }
 
     #[test]
