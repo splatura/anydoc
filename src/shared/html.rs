@@ -1,10 +1,24 @@
 //! (X)HTML element tree -> model blocks. Used by the EPUB frontend.
 //!
 //! Applies a deliberately small CSS subset - the semantic properties only:
-//! `font-weight`, `font-style`, `text-decoration: line-through`, and
-//! `display: none` - from inline `style` attributes and element/class rules.
+//! `font-weight`, `font-style`, `text-decoration: line-through`, and the
+//! hiding properties below - from inline `style` attributes and
+//! element/class rules alike (both funnel through [`parse_declarations`]).
 //! Tables build the canonical grid (`rowspan`/`colspan`); ordered lists honor
 //! `start`, `reversed`, `type`, and per-item `value`.
+//!
+//! Author-hidden content is dropped, with no option to keep it: `display:
+//! none`, `visibility: hidden`/`collapse`, `opacity: 0` (numeric zero in any
+//! form, `0%` included though not valid CSS), `font-size: 0` (any unit), the
+//! `hidden` attribute (a boolean attribute - any value hides, including
+//! `hidden="until-found"`), and `aria-hidden="true"`. A hidden ancestor
+//! hides every descendant regardless of the descendant's own declarations -
+//! [`Builder::walk_elem`] returns before recursing once an element's own
+//! props resolve hidden, so a child's `display: block` never gets a chance
+//! to run. White-on-white text and off-page positioning are out of scope:
+//! not reliably detectable from markup alone. A closed (non-`open`)
+//! `<details>` is left as-is - its body is a UI click away, not
+//! author-hidden content, so it still renders.
 
 use crate::error::ConvertError;
 use crate::model::{
@@ -44,9 +58,12 @@ pub fn to_blocks(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StyleProps {
     pub delta: StyleDelta,
-    /// `display` visibility as a tri-state: a higher-priority
-    /// `display: block` (or any non-none value) can restore content a
-    /// lower-priority `display: none` hid.
+    /// Author-hidden visibility as a tri-state, combining `display`,
+    /// `visibility`, `opacity`, and `font-size` (see the module docs for the
+    /// exact triggers): a higher-priority declaration that resolves visible
+    /// can restore content a lower-priority one hid, on the same element.
+    /// It cannot reach across elements - a hidden ancestor's descendants
+    /// are skipped outright, never re-evaluated.
     pub hidden: Option<bool>,
 }
 
@@ -198,10 +215,37 @@ fn parse_declarations(body: &str) -> DeclProps {
             "display" => {
                 props.hidden = Some(value == "none");
             }
+            "visibility" => {
+                if value == "hidden" || value == "collapse" {
+                    props.hidden = Some(true);
+                } else if value == "visible" {
+                    props.hidden = Some(false);
+                }
+            }
+            "opacity" => {
+                if is_zero_value(&value) {
+                    props.hidden = Some(true);
+                }
+            }
+            "font-size" => {
+                if is_zero_value(&value) {
+                    props.hidden = Some(true);
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// Whether a CSS numeric value - with or without a trailing unit (`px`,
+/// `em`, `pt`, `%`) - is zero. Used for `opacity` and `font-size`, where
+/// `0`, `0.0`, `0px`, and `0%` all read as "invisible" even though not
+/// every combination is valid CSS (`opacity` takes no unit, but documents
+/// spell it like a length anyway often enough to be worth tolerating).
+fn is_zero_value(value: &str) -> bool {
+    let numeric = value.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
+    numeric.parse::<f64>().is_ok_and(|n| n == 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +357,17 @@ impl Builder<'_> {
         let mut props = StyleProps::default();
         for (_, entry) in entries {
             props = props.merge(entry);
+        }
+        // The `hidden` attribute (a boolean attribute: any value, including
+        // `hidden="until-found"`, hides) and `aria-hidden="true"` are HTML
+        // semantics, not CSS - they sit outside the cascade above and force
+        // hidden regardless of any `display`/`visibility`/etc. declaration,
+        // unlike a browser's low-specificity UA rule for `[hidden]` which an
+        // author style can override.
+        if elem.attr_any("hidden").is_some()
+            || elem.attr_any("aria-hidden").is_some_and(|v| v == "true")
+        {
+            props.hidden = Some(true);
         }
         props
     }
@@ -919,5 +974,100 @@ mod tests {
         assert!(matches!(&t.grid[0][0], CellSlot::Origin(c) if c.row_span == 2));
         assert!(matches!(t.grid[1][0], CellSlot::Covered { origin_row: 0, origin_col: 0 }));
         assert!(matches!(&t.grid[2][0], CellSlot::Origin(_)), "next group must not be covered");
+    }
+
+    #[test]
+    fn visibility_hidden_and_collapse_drop_content_from_inline_style() {
+        let out = blocks(r#"<body><p style="visibility: hidden">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+
+        let out = blocks(r#"<body><p style="visibility: collapse">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn visibility_hidden_from_a_style_rule_by_class() {
+        let css = "p.gone { visibility: hidden }";
+        let out = blocks_with_css(r#"<body><p class="gone">x</p><p>y</p></body>"#, css);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn opacity_zero_drops_content() {
+        for value in ["0", "0.0", "0%"] {
+            let html = format!(r#"<body><p style="opacity: {value}">x</p><p>y</p></body>"#);
+            let out = blocks(&html);
+            assert_eq!(out.len(), 1, "opacity: {value} should hide its paragraph");
+            assert_eq!(para_text(&out[0]), "y");
+        }
+        // A non-zero opacity keeps the content.
+        let out = blocks(r#"<body><p style="opacity: 0.5">x</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "x");
+    }
+
+    #[test]
+    fn font_size_zero_drops_content_in_any_unit() {
+        for value in ["0", "0px", "0em", "0pt", "0%"] {
+            let html = format!(r#"<body><p style="font-size: {value}">x</p><p>y</p></body>"#);
+            let out = blocks(&html);
+            assert_eq!(out.len(), 1, "font-size: {value} should hide its paragraph");
+            assert_eq!(para_text(&out[0]), "y");
+        }
+    }
+
+    #[test]
+    fn hidden_attribute_drops_content_regardless_of_value() {
+        // XHTML must quote every attribute, so a boolean attribute is
+        // written `hidden=""` (or `hidden="hidden"`) rather than bare
+        // `hidden`; either still hides.
+        let out = blocks(r#"<body><p hidden="">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+
+        // Any value hides, including `hidden="until-found"`.
+        let out = blocks(r#"<body><p hidden="until-found">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn aria_hidden_true_drops_content() {
+        let out = blocks(r#"<body><p aria-hidden="true">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+
+        // Any other value is not a hiding signal.
+        let out = blocks(r#"<body><p aria-hidden="false">x</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "x");
+    }
+
+    #[test]
+    fn hidden_ancestor_hides_descendants_regardless_of_their_own_display() {
+        // A child's `display: block` must not resurrect content inside a
+        // `display: none` ancestor: descendants never see their own props
+        // once the ancestor itself is skipped.
+        let html = r#"<body>
+            <div style="display: none">
+                <p style="display: block">x</p>
+            </div>
+            <p>y</p>
+        </body>"#;
+        let out = blocks(html);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn closed_details_body_is_left_visible() {
+        // A UI-collapsed <details> is not author-hidden content: its body
+        // stays in the output whether or not `open` is present.
+        let out = blocks("<body><details><summary>s</summary><p>x</p></details></body>");
+        let text: String = out.iter().map(para_text).collect::<Vec<_>>().join(" ");
+        assert!(text.contains('x'), "{out:?}");
     }
 }

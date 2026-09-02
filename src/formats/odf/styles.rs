@@ -234,6 +234,11 @@ pub fn text_properties_delta(elem: &Element) -> StyleDelta {
         italic: props.attr(ns::FO, "font-style").map(|s| s == "italic" || s == "oblique"),
         strike: props.attr(ns::STYLE, "text-line-through-style").map(|lt| lt != "none"),
         code: None,
-        hidden: None,
+        // `text:display` is `"true"` (visible, the default), `"none"`
+        // (author-hidden), or `"condition"` (visible unless a
+        // `text:condition` evaluates false at display time - we don't
+        // evaluate field conditions, so "condition" resolves visible here,
+        // same as any value other than the literal `"none"`).
+        hidden: props.attr(ns::TEXT, "display").map(|v| v == "none"),
     }
 }

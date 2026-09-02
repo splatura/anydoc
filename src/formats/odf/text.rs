@@ -1,4 +1,11 @@
 //! Block and inline walking for ODF text content.
+//!
+//! Author-hidden text (`text:display="none"` on a style's
+//! `style:text-properties`, resolved through the style chain the same way
+//! as bold/italic/strike) is dropped, with no option to keep it: a hidden
+//! paragraph contributes nothing at all, and a hidden `text:span` drops
+//! only its own subtree. `text:display="condition"` is treated as visible
+//! (the field's live condition is not evaluated).
 
 use crate::error::ConvertError;
 use crate::formats::odf::styles::{LIST_LEVELS, OdfStyles, parse_start};
@@ -93,6 +100,14 @@ fn parse_block_elem(
                 return Ok(());
             }
             "p" => {
+                // Author-hidden (`text:display="none"`, resolved through
+                // the paragraph style chain same as bold): the paragraph
+                // contributes nothing, not even as an empty placeholder,
+                // and the surrounding run of same-styled paragraphs treats
+                // it as if it were never there.
+                if paragraph_base(elem, ctx)?.hidden == Some(true) {
+                    return Ok(());
+                }
                 let (inlines, boxes) = parse_inline_content(elem, ctx)?;
                 let style =
                     elem.attr(ns::TEXT, "style-name").and_then(|n| ctx.styles.block_style(n));
@@ -297,6 +312,9 @@ fn parse_inline_content(
     ctx: &Ctx,
 ) -> Result<(Vec<Inline>, Vec<Block>), ConvertError> {
     let base = paragraph_base(elem, ctx)?;
+    if base.hidden == Some(true) {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut out = Vec::new();
     let mut boxes = Vec::new();
     walk_inlines(elem, ctx, base, &mut out, &mut boxes)?;
@@ -334,7 +352,12 @@ fn walk_inlines(
                                 Some(name) => delta.merge(ctx.styles.delta("text", name)?),
                                 None => delta,
                             };
-                            walk_inlines(child, ctx, merged, out, boxes)?;
+                            // Author-hidden span (`text:display="none"` on
+                            // its character style, resolved through the
+                            // same chain as bold): drop its content.
+                            if merged.hidden != Some(true) {
+                                walk_inlines(child, ctx, merged, out, boxes)?;
+                            }
                             continue;
                         }
                         "a" => {
