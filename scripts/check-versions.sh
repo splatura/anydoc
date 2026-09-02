@@ -50,8 +50,15 @@ guard_version=$(grep -o "!== '[^']*'" node/index.js | head -n 1 | sed "s/^!== '/
 
 # The agent skill pins the npm package in every `npx` example, e.g.
 # `npx -y @firecrawl/anydoc@0.2.4 <file>`. Collect every distinct pin found.
-skill_versions=$(grep -oE '@firecrawl/anydoc@[0-9]+\.[0-9]+\.[0-9]+' "$skill_file" | sed 's/.*anydoc@//' | sort -u)
+skill_versions=$(grep -oE '@firecrawl/anydoc@[0-9A-Za-z.+-]+' "$skill_file" | sed 's/.*anydoc@//' | sort -u)
 skill_version=$(printf '%s\n' "$skill_versions" | tr '\n' ',' | sed 's/,$//')
+
+# Any `npx` example that mentions @firecrawl/anydoc without a version pin
+# (e.g. the pin was accidentally dropped) is a supply-chain regression.
+if grep -E 'npx[^\n]*@firecrawl/anydoc([^@]|$)' "$skill_file" >/dev/null; then
+  report "error: unpinned npx @firecrawl/anydoc example in $skill_file"
+  err=1
+fi
 
 [ -n "$cargo_version" ]        || { report "error: could not read [package].version from Cargo.toml"; err=1; }
 [ -n "$python_version" ]       || { report "error: could not read [package].version from python/Cargo.toml"; err=1; }
@@ -87,7 +94,7 @@ if [ "$#" -ge 1 ] && [ -n "$1" ]; then
   if [ "$tag" != "v$cargo_version" ]; then
     report "error: tag '$tag' does not match the declared version '$cargo_version' (expected tag 'v$cargo_version')."
     report "fix: either delete the tag and re-tag the commit that declares ${tag#v},"
-    report "     or bump all four version locations to ${tag#v} and tag that commit."
+    report "     or bump all six version locations to ${tag#v} and tag that commit."
     exit 1
   fi
 fi
