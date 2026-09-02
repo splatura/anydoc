@@ -4,7 +4,8 @@ use crate::model::{ImageSource, Inline, LinkTarget, Style, checkbox_text, inline
 use crate::render::markdown::Ctx;
 use crate::render::markdown::escape::{
     Delims, EscapeOpts, InlineContext, backtick_fence, escape_cell_code_span, escape_text,
-    escape_url_as_text, format_url,
+    escape_url_as_text, format_url, guard_html_in_math, relative_target_allowed,
+    url_scheme_allowed,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -62,8 +63,9 @@ pub(crate) fn normalize<'a>(inlines: &'a [Inline], rc: &Ctx) -> Vec<Norm<'a>> {
                 out.push(Norm::Text { text: Cow::Borrowed(text.as_str()), style });
             }
             Inline::Link { content, target } => {
-                if target.is_empty() {
-                    // No usable destination: keep the content as plain inlines.
+                if !link_target_allowed(target) {
+                    // No usable or safe destination: keep the content as
+                    // plain inlines, dropping the destination.
                     if !inlines_are_empty(content) {
                         out.extend(normalize(content, rc));
                     }
@@ -187,15 +189,12 @@ fn render_image(
     out: &mut String,
 ) {
     match source {
-        ImageSource::External(url) => {
-            let alt =
-                escape_text(alt.trim(), ctx, EscapeOpts { in_label: true, ..Default::default() });
-            let _ = write!(out, "![{}]({})", alt, format_url(url));
-        }
         // Embedded assets render as their alt text: Markdown cannot embed
-        // bytes, and the bytes stay available in `Document::assets`. A
+        // bytes, and the bytes stay available in `Document::assets`. An
+        // external URL renders the same way: emitting it would make any
+        // Markdown viewer fetch an attacker-controlled address. A
         // source-less image has only its alt text to offer.
-        ImageSource::Asset(_) | ImageSource::Unavailable => {
+        ImageSource::External(_) | ImageSource::Asset(_) | ImageSource::Unavailable => {
             if !alt.trim().is_empty() {
                 out.push_str(&escape_text(
                     alt.trim(),
@@ -265,12 +264,8 @@ fn delims_of(run: &Norm, rc: &Ctx) -> Delims {
                 }
             }
         },
-        Norm::Image { alt, source } => match source {
-            ImageSource::External(_) if alt.contains('`') => delims.insert('`'),
-            ImageSource::External(_) => {}
-            // Sourceless images degrade to their alt as plain text.
-            ImageSource::Asset(_) | ImageSource::Unavailable => delims.insert_closers(alt),
-        },
+        // Every image source renders as plain alt text (see `render_image`).
+        Norm::Image { alt, .. } => delims.insert_closers(alt),
         Norm::NoteRef(_)
         | Norm::Anchor(_)
         | Norm::LineBreak
@@ -285,6 +280,22 @@ fn starts_with_space(run: &Norm) -> bool {
         Norm::Text { text, .. } => text.starts_with(char::is_whitespace),
         Norm::LineBreak => true,
         _ => false,
+    }
+}
+
+/// Whether a link's target is both non-empty and a safe destination to keep:
+/// an external URL must use an allow-listed scheme, and a relative reference
+/// must not actually be a UNC path or protocol-relative URL in disguise. An
+/// unresolved anchor is still kept here — that degrades later, once anchor
+/// resolution is known, in [`render_link`].
+fn link_target_allowed(target: &LinkTarget) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    match target {
+        LinkTarget::External(url) => url_scheme_allowed(url),
+        LinkTarget::Relative(url) => relative_target_allowed(url),
+        LinkTarget::Anchor(_) => true,
     }
 }
 
@@ -364,9 +375,10 @@ fn render_text_run(
 /// inside it would end the paragraph's math span, and a bare `$` (never
 /// valid inside math) would close it early.
 pub(crate) fn push_math_span(tex: &str, ctx: InlineContext, out: &mut String) {
-    let mut source = String::with_capacity(tex.len());
+    let guarded = guard_html_in_math(tex.trim());
+    let mut source = String::with_capacity(guarded.len());
     let mut backslashes = 0;
-    for c in tex.trim().chars() {
+    for c in guarded.chars() {
         match c {
             '\n' => source.push(' '),
             '$' if backslashes % 2 == 0 => source.push_str("\\$"),

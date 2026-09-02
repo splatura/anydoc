@@ -299,6 +299,53 @@ pub(crate) fn escape_url_as_text(url: &str, ctx: InlineContext) -> String {
     )
 }
 
+/// Schemes this renderer will still keep as a link destination.
+/// `javascript:`, `vbscript:`, `data:`, `file:` and unrecognized schemes can
+/// run script or read local files when a Markdown viewer resolves them, so
+/// only well-understood navigation schemes survive.
+const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto", "tel", "ftp", "ftps"];
+
+/// Whether `url`'s scheme (the text before its first `:`, compared ASCII
+/// case-insensitively) is one the renderer keeps as a link destination.
+/// A destination with no `:` at all has no scheme and is not kept.
+pub(crate) fn url_scheme_allowed(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => {
+            ALLOWED_URL_SCHEMES.iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        }
+        None => false,
+    }
+}
+
+/// Whether a scheme-less relative reference is actually confined to being
+/// relative: not a UNC path (`\\server\share`) or a protocol-relative URL
+/// (`//host/path`), both of which resolve outside the document the same way
+/// an absolute URL with a scheme would.
+pub(crate) fn relative_target_allowed(url: &str) -> bool {
+    !url.starts_with(r"\\") && !url.starts_with("//")
+}
+
+/// Neutralizes HTML markup inside math source without changing its TeX
+/// meaning: after each `<` immediately followed by an ASCII letter, `/`, `!`
+/// or `?` (the shapes that open a tag, a closing tag, a comment, or a
+/// processing instruction) the empty TeX group `{}` is inserted, so
+/// `<script>` becomes `<{}script>`. `{}` is a no-op grouping in TeX and in
+/// KaTeX/MathJax, so the math still renders the same; a `<` followed by
+/// anything else (`a < b`, `x<=y`) is left alone.
+pub(crate) fn guard_html_in_math(tex: &str) -> String {
+    let mut out = String::with_capacity(tex.len());
+    let mut chars = tex.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '<'
+            && chars.peek().is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
+        {
+            out.push_str("{}");
+        }
+    }
+    out
+}
+
 /// Prepare a code span's text for a table cell, where a pipe is the only
 /// character between the fences that is still syntax.
 ///
@@ -330,4 +377,65 @@ pub(crate) fn escape_cell_code_span(text: &str) -> String {
 pub(crate) fn backtick_fence(text: &str, min: usize) -> String {
     let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     "`".repeat((longest_run + 1).max(min))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_schemes_kept_case_insensitively() {
+        assert!(url_scheme_allowed("https://example.com"));
+        assert!(url_scheme_allowed("HTTP://example.com"));
+        assert!(url_scheme_allowed("mailto:a@b.c"));
+        assert!(url_scheme_allowed("tel:+1-555-0100"));
+        assert!(url_scheme_allowed("ftp://example.com"));
+        assert!(url_scheme_allowed("ftps://example.com"));
+    }
+
+    #[test]
+    fn dangerous_or_unrecognized_schemes_rejected() {
+        assert!(!url_scheme_allowed("javascript:alert(1)"));
+        assert!(!url_scheme_allowed("JAVASCRIPT:alert(1)"));
+        assert!(!url_scheme_allowed("vbscript:msgbox(1)"));
+        assert!(!url_scheme_allowed("data:text/html,<script>1</script>"));
+        assert!(!url_scheme_allowed("file:///etc/passwd"));
+        assert!(!url_scheme_allowed("no-scheme-at-all"));
+    }
+
+    #[test]
+    fn unc_and_protocol_relative_targets_rejected() {
+        assert!(!relative_target_allowed(r"\\evil\share"));
+        assert!(!relative_target_allowed("//evil/x"));
+    }
+
+    #[test]
+    fn ordinary_relative_targets_allowed() {
+        assert!(relative_target_allowed("../x.html"));
+        assert!(relative_target_allowed("chapter2.xhtml#top"));
+    }
+
+    #[test]
+    fn math_guard_neutralizes_tag_like_shapes() {
+        assert_eq!(
+            guard_html_in_math("<script>alert(1)</script>"),
+            "<{}script>alert(1)<{}/script>"
+        );
+        assert_eq!(guard_html_in_math("<!-- c -->"), "<{}!-- c -->");
+        assert_eq!(guard_html_in_math("<?xml?>"), "<{}?xml?>");
+    }
+
+    #[test]
+    fn math_guard_leaves_comparisons_alone() {
+        assert_eq!(guard_html_in_math("a < b"), "a < b");
+        assert_eq!(guard_html_in_math("x<=y"), "x<=y");
+    }
+
+    #[test]
+    fn math_guard_still_guards_a_bare_letter_after_lt() {
+        // Documented as accepted: TeX has no syntax where `<letter>` means
+        // anything but comparison-then-identifier, so the guard cannot tell
+        // this apart from a tag and always inserts the group.
+        assert_eq!(guard_html_in_math("a<b"), "a<{}b");
+    }
 }

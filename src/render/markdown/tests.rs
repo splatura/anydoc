@@ -59,6 +59,34 @@ fn math_in_a_table_cell_escapes_pipes() {
 }
 
 #[test]
+fn inline_math_html_is_guarded() {
+    // M-P1-1: a `<` that could open a tag, closing tag, comment, or
+    // processing instruction is neutralized with TeX's no-op empty group.
+    let md = doc(vec![Block::Paragraph(vec![Inline::Math("<script>alert(1)</script>".into())])]);
+    assert_eq!(md, "$<{}script>alert(1)<{}/script>$\n");
+}
+
+#[test]
+fn block_math_html_is_guarded() {
+    let md = doc(vec![Block::Math("<script>alert(1)</script>\n<!-- c -->".into())]);
+    assert_eq!(md, "$$\n<{}script>alert(1)<{}/script>\n<{}!-- c -->\n$$\n");
+}
+
+#[test]
+fn math_html_guard_leaves_comparisons_alone() {
+    let md = doc(vec![Block::Paragraph(vec![
+        Inline::Math("a<b".into()),
+        Inline::plain(" and "),
+        Inline::Math("a < b".into()),
+        Inline::plain(" and "),
+        Inline::Math("x<=y".into()),
+    ])]);
+    // `a<b` is documented as accepted: TeX has no way to tell a bare
+    // identifier after `<` apart from the start of a tag.
+    assert_eq!(md, "$a<{}b$ and $a < b$ and $x<=y$\n");
+}
+
+#[test]
 fn escapes_paired_syntax_chars() {
     let md = doc(vec![Block::Paragraph(vec![Inline::plain("a *bold* _it_ ~st~ `code`")])]);
     assert_eq!(md, "a \\*bold* \\_it_ \\~st~ \\`code`\n");
@@ -275,6 +303,66 @@ fn relative_links_preserved() {
         target: LinkTarget::External("mailto:a@b.c".into()),
     }])]);
     assert_eq!(md, "[mail](mailto:a@b.c)\n");
+}
+
+#[test]
+fn dangerous_url_schemes_degrade_to_plain_label() {
+    // M-P1-2: only well-understood navigation schemes stay as a link
+    // destination; anything else keeps just the label.
+    for scheme_url in [
+        "javascript:alert(1)",
+        "vbscript:msgbox(1)",
+        "data:text/html,x",
+        "file:///etc/passwd",
+        "JAVASCRIPT:alert(1)",
+    ] {
+        let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+            content: vec![Inline::plain("click")],
+            target: LinkTarget::External(scheme_url.into()),
+        }])]);
+        assert_eq!(md, "click\n", "scheme {scheme_url}");
+    }
+}
+
+#[test]
+fn allowed_url_schemes_keep_the_link() {
+    for (scheme_url, expected) in [
+        ("https://e.test", "[go](https://e.test)\n"),
+        ("HTTP://e.test", "[go](HTTP://e.test)\n"),
+        ("mailto:a@b.c", "[go](mailto:a@b.c)\n"),
+        ("tel:+15550100", "[go](tel:+15550100)\n"),
+    ] {
+        let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+            content: vec![Inline::plain("go")],
+            target: LinkTarget::External(scheme_url.into()),
+        }])]);
+        assert_eq!(md, expected, "scheme {scheme_url}");
+    }
+}
+
+#[test]
+fn unc_and_protocol_relative_targets_degrade_to_plain_label() {
+    for target in [r"\\evil\share", "//evil/x"] {
+        let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+            content: vec![Inline::plain("click")],
+            target: LinkTarget::Relative(target.into()),
+        }])]);
+        assert_eq!(md, "click\n", "target {target}");
+    }
+}
+
+#[test]
+fn ordinary_relative_targets_keep_the_link() {
+    let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+        content: vec![Inline::plain("next")],
+        target: LinkTarget::Relative("../x.html".into()),
+    }])]);
+    assert_eq!(md, "[next](../x.html)\n");
+    let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+        content: vec![Inline::plain("ch2")],
+        target: LinkTarget::Relative("chapter2.xhtml#top".into()),
+    }])]);
+    assert_eq!(md, "[ch2](chapter2.xhtml#top)\n");
 }
 
 #[test]
@@ -697,9 +785,40 @@ fn link_label_bracket_escaped() {
 fn image_alt_brackets_and_backslash_escaped() {
     let md = doc(vec![Block::Paragraph(vec![Inline::Image {
         alt: "a[b]c\\".into(),
-        source: ImageSource::External("https://e.com/i.png".into()),
+        source: ImageSource::Asset(crate::model::AssetId(0)),
     }])]);
-    assert_eq!(md, "![a\\[b\\]c\\\\](https://e.com/i.png)\n");
+    assert_eq!(md, "a\\[b]c\\\\\n");
+}
+
+#[test]
+fn external_image_renders_as_alt_text_only() {
+    // M-P1-3: an external image URL is never emitted, so no Markdown viewer
+    // fetches an attacker-controlled address just by opening the document.
+    let md = doc(vec![Block::Paragraph(vec![Inline::Image {
+        alt: "a[b]c\\".into(),
+        source: ImageSource::External("http://evil.test/pixel.png?u=victim".into()),
+    }])]);
+    assert_eq!(md, "a\\[b]c\\\\\n");
+}
+
+#[test]
+fn data_url_image_renders_as_alt_text_only() {
+    let md = doc(vec![Block::Paragraph(vec![Inline::Image {
+        alt: "chart".into(),
+        source: ImageSource::External("data:image/png;base64,QQ==".into()),
+    }])]);
+    assert_eq!(md, "chart\n");
+}
+
+#[test]
+fn external_image_with_empty_alt_renders_nothing() {
+    // Matches the existing behavior for a source-less (Asset/Unavailable)
+    // image with empty alt text: nothing is emitted.
+    let md = doc(vec![Block::Paragraph(vec![Inline::Image {
+        alt: "".into(),
+        source: ImageSource::External("https://e.test/pixel.png".into()),
+    }])]);
+    assert_eq!(md, "");
 }
 
 #[test]
