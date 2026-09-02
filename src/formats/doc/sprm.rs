@@ -69,30 +69,50 @@ pub fn chpx_pic_location(grpprl: &[u8]) -> Option<u32> {
     location
 }
 
+/// Character formatting plus the hidden state, resolved together: both
+/// cascade through the same style chain -> CHPX -> piece Prm layers, but
+/// hidden never reaches [`Style`] (the model has no such field) so it is
+/// carried alongside it instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Chp {
+    pub style: Style,
+    /// `sprmCFVanish` (hidden text) or `sprmCFRMarkDel` (marked for
+    /// deletion by revision tracking): both are toggles that resolve
+    /// against the same style-chain base, the same as bold/italic/strike.
+    pub hidden: bool,
+}
+
 /// Apply a CHPX grpprl over `current`, resolving toggle operands against the
 /// style chain's value (`style_base`), per the published algorithm.
-pub fn apply_chpx(grpprl: &[u8], current: Style, style_base: Style) -> Style {
-    let mut style = current;
+pub fn apply_chpx(grpprl: &[u8], current: Chp, style_base: Chp) -> Chp {
+    let mut chp = current;
     walk_sprms(grpprl, |sprm, operand| match sprm {
         // sprmCFBold / sprmCFItalic / sprmCFStrike are toggles.
         0x0835 => {
-            if let Some(v) = toggle(operand, style_base.bold) {
-                style.bold = v;
+            if let Some(v) = toggle(operand, style_base.style.bold) {
+                chp.style.bold = v;
             }
         }
         0x0836 => {
-            if let Some(v) = toggle(operand, style_base.italic) {
-                style.italic = v;
+            if let Some(v) = toggle(operand, style_base.style.italic) {
+                chp.style.italic = v;
             }
         }
         0x0837 => {
-            if let Some(v) = toggle(operand, style_base.strike) {
-                style.strike = v;
+            if let Some(v) = toggle(operand, style_base.style.strike) {
+                chp.style.strike = v;
+            }
+        }
+        // sprmCFVanish / sprmCFRMarkDel: hidden text, or text marked for
+        // deletion by revision tracking - both hide the run the same way.
+        0x0818 | 0x0800 => {
+            if let Some(v) = toggle(operand, style_base.hidden) {
+                chp.hidden = v;
             }
         }
         _ => {}
     });
-    style
+    chp
 }
 
 /// A row's table properties from `sprmTDefTable` and its companion table
@@ -246,6 +266,54 @@ fn parse_tdef_table(operand: &[u8]) -> Option<Tap> {
 
 /// A CHPX grpprl interpreted as a character-style *definition* layer: the
 /// parent's value is the base for its toggles.
-pub fn apply_style_chpx(grpprl: &[u8], parent: Style) -> Style {
+pub fn apply_style_chpx(grpprl: &[u8], parent: Chp) -> Chp {
     apply_chpx(grpprl, parent, parent)
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+
+    fn vanish_grpprl(operand: u8) -> Vec<u8> {
+        vec![0x18, 0x08, operand] // sprmCFVanish
+    }
+
+    fn rmark_del_grpprl(operand: u8) -> Vec<u8> {
+        vec![0x00, 0x08, operand] // sprmCFRMarkDel
+    }
+
+    #[test]
+    fn sprm_cf_vanish_sets_hidden_absolutely() {
+        let base = Chp::default();
+        assert!(apply_chpx(&vanish_grpprl(1), base, base).hidden);
+        assert!(!apply_chpx(&vanish_grpprl(0), Chp { hidden: true, ..base }, base).hidden);
+    }
+
+    #[test]
+    fn sprm_cf_vanish_toggle_operand_resolves_against_the_style_base() {
+        let hidden_base = Chp { hidden: true, ..Chp::default() };
+        let plain_base = Chp::default();
+        // 0x80 = the style's own value; 0x81 = its inversion.
+        assert!(apply_chpx(&vanish_grpprl(0x80), plain_base, hidden_base).hidden);
+        assert!(!apply_chpx(&vanish_grpprl(0x81), plain_base, hidden_base).hidden);
+        assert!(apply_chpx(&vanish_grpprl(0x81), plain_base, plain_base).hidden);
+    }
+
+    #[test]
+    fn sprm_cf_rmark_del_hides_the_same_way_as_vanish() {
+        let base = Chp::default();
+        assert!(apply_chpx(&rmark_del_grpprl(1), base, base).hidden);
+        assert!(!apply_chpx(&rmark_del_grpprl(0), Chp { hidden: true, ..base }, base).hidden);
+        let hidden_base = Chp { hidden: true, ..base };
+        assert!(apply_chpx(&rmark_del_grpprl(0x80), base, hidden_base).hidden);
+        assert!(!apply_chpx(&rmark_del_grpprl(0x81), base, hidden_base).hidden);
+    }
+
+    #[test]
+    fn hidden_is_independent_of_bold_italic_strike() {
+        let base = Chp { style: Style { bold: true, ..Style::PLAIN }, hidden: false };
+        let chp = apply_chpx(&vanish_grpprl(1), base, base);
+        assert!(chp.hidden);
+        assert!(chp.style.bold, "vanish must not disturb unrelated toggles");
+    }
 }

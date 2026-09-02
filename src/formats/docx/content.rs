@@ -262,6 +262,7 @@ fn parse_paragraph(p: &Element, ctx: &Ctx) -> Result<(ParaKind, Vec<Piece>), Con
         None => Default::default(),
     };
     let paragraph_level = parity.apply_over(ctx.styles.doc_defaults);
+    let paragraph_hidden = parity.hidden_over(ctx.styles.doc_defaults_hidden);
 
     let kind = match heading {
         Some(level) => {
@@ -282,7 +283,7 @@ fn parse_paragraph(p: &Element, ctx: &Ctx) -> Result<(ParaKind, Vec<Piece>), Con
         },
     };
 
-    let mut walker = InlineWalker::new(ctx, paragraph_level);
+    let mut walker = InlineWalker::new(ctx, paragraph_level, paragraph_hidden);
     walker.walk(p)?;
     Ok((kind, walker.finish()))
 }
@@ -349,14 +350,24 @@ fn resolve_numbering(
 struct InlineWalker<'a, 'b, 'e> {
     ctx: &'e Ctx<'a, 'b>,
     base: Style,
+    /// The base hidden state runs inherit absent their own rPr - alongside
+    /// `base` for the same reason `Toggles` keeps hidden outside `Style`.
+    base_hidden: bool,
     pieces: Vec<Piece>,
     current: Vec<Inline>,
     fields: Vec<FieldFrame>,
 }
 
 impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
-    fn new(ctx: &'e Ctx<'a, 'b>, base: Style) -> Self {
-        InlineWalker { ctx, base, pieces: Vec::new(), current: Vec::new(), fields: Vec::new() }
+    fn new(ctx: &'e Ctx<'a, 'b>, base: Style, base_hidden: bool) -> Self {
+        InlineWalker {
+            ctx,
+            base,
+            base_hidden,
+            pieces: Vec::new(),
+            current: Vec::new(),
+            fields: Vec::new(),
+        }
     }
 
     fn push(&mut self, inline: Inline) {
@@ -406,7 +417,7 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                 "r" => self.walk_run(child)?,
                 "hyperlink" => {
                     let target = self.hyperlink_link_target(child);
-                    let mut inner = InlineWalker::new(self.ctx, self.base);
+                    let mut inner = InlineWalker::new(self.ctx, self.base, self.base_hidden);
                     inner.walk(child)?;
                     let (content, attachments) = split_pieces(inner.finish());
                     if let Some(target) = target {
@@ -422,7 +433,7 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                 }
                 "fldSimple" => {
                     let instr = child.attr(ns::W, "instr").unwrap_or("").to_string();
-                    let mut inner = InlineWalker::new(self.ctx, self.base);
+                    let mut inner = InlineWalker::new(self.ctx, self.base, self.base_hidden);
                     inner.walk(child)?;
                     let (content, attachments) = split_pieces(inner.finish());
                     self.push_field_result(&instr, content);
@@ -462,7 +473,7 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
     }
 
     fn walk_run(&mut self, run: &Element) -> Result<(), ConvertError> {
-        let style = match run.find(ns::W, "rPr") {
+        let (style, hidden) = match run.find(ns::W, "rPr") {
             Some(rpr) => {
                 // Character-style chain: another toggle layer over the
                 // paragraph-level value. Direct formatting is absolute.
@@ -472,10 +483,18 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                     None => Default::default(),
                 };
                 let with_char = char_parity.apply_over(self.base);
-                rpr_delta(rpr).apply(with_char)
+                let with_char_hidden = char_parity.hidden_over(self.base_hidden);
+                let delta = rpr_delta(rpr);
+                (delta.apply(with_char), delta.hidden.unwrap_or(with_char_hidden))
             }
-            None => self.base,
+            None => (self.base, self.base_hidden),
         };
+        if hidden {
+            // Author-hidden text (`w:vanish`/`w:webHidden`) is omitted along
+            // with everything the run carries - text, breaks, drawings, and
+            // footnote/endnote references - the same way Word hides them.
+            return Ok(());
+        }
         self.walk_run_content(run, style)
     }
 
