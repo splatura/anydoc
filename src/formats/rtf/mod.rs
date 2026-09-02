@@ -1,7 +1,9 @@
 //! RTF frontend: a position-explicit lexer feeding a state machine, with the
 //! font/style/list tables parsed into typed definitions up front. Numbering
 //! comes from the list tables - never guessed from label text. Page
-//! headers/footers are excluded (fixed policy).
+//! headers/footers are excluded (fixed policy). Text the author hid
+//! (`\v`) and tracked-deletion text (`\deleted`) are omitted, with no
+//! option to keep them, matching how DOCX drops tracked deletions.
 
 mod lexer;
 mod table;
@@ -79,6 +81,13 @@ struct CharState {
     suppress: bool,
     capture: Capture,
     note: Option<NoteKind>,
+    /// `\v`: text the author marked hidden. Omitted with no option, matching
+    /// DOCX's treatment of hidden runs.
+    hidden: bool,
+    /// `\deleted`: tracked-deletion text. Omitted with no option, matching
+    /// how DOCX drops tracked deletions. `\revised` (inserted text) is not
+    /// hidden and is unaffected.
+    deleted: bool,
 }
 
 impl Default for CharState {
@@ -98,6 +107,8 @@ impl Default for CharState {
             suppress: false,
             capture: Capture::None,
             note: None,
+            hidden: false,
+            deleted: false,
         }
     }
 }
@@ -621,6 +632,11 @@ struct Parser<'a> {
     table: TableState,
     dest: Destinations,
     assets: crate::shared::assets::AssetSink,
+    /// A hidden/deleted run was just dropped: the next visible text run
+    /// trims its leading whitespace if the previous visible run already
+    /// ends in whitespace, so the source's real spaces on either side of
+    /// the dropped run don't double up.
+    hidden_drop_pending: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -644,6 +660,7 @@ impl<'a> Parser<'a> {
             table: TableState::new(),
             dest: Destinations::default(),
             assets: crate::shared::assets::AssetSink::new(),
+            hidden_drop_pending: false,
         }
     }
 
@@ -723,6 +740,15 @@ impl<'a> Parser<'a> {
         self.state.capture != Capture::None || !self.state.suppress
     }
 
+    /// Whether inline content produced right now (text or a line break)
+    /// should actually reach the document: not inside a suppressed
+    /// destination, and not hidden (`\v`) or tracked-deletion (`\deleted`)
+    /// text. Structure control words (`\par`, `\row`, `\cell`) are not
+    /// inline content and must not be gated by this.
+    fn text_visible(&self) -> bool {
+        !self.state.suppress && !self.state.hidden && !self.state.deleted
+    }
+
     fn control_symbol(&mut self, b: u8) {
         match b {
             b'~' => self.push_char('\u{a0}'),
@@ -781,11 +807,21 @@ impl<'a> Parser<'a> {
             "b" => self.set_style(|s| s.bold = on),
             "i" => self.set_style(|s| s.italic = on),
             "strike" | "striked" => self.set_style(|s| s.strike = on),
+            "v" => {
+                self.flush_pending();
+                self.state.hidden = on;
+            }
+            "deleted" => {
+                self.flush_pending();
+                self.state.deleted = on;
+            }
             "plain" => {
                 self.flush_pending();
                 let font = self.state.font;
                 self.state.style = Style::PLAIN;
                 self.state.font = font;
+                self.state.hidden = false;
+                self.state.deleted = false;
             }
             "s" => {
                 // Paragraph style: outline level for headings plus its
@@ -802,7 +838,12 @@ impl<'a> Parser<'a> {
             "par" | "sect" => {
                 self.flush_pending();
                 if self.state.note.is_some() {
-                    self.inlines.push(Inline::LineBreak);
+                    // A line break inside a note body is inline content,
+                    // not paragraph structure, so it is gated like any
+                    // other hidden/deleted text would be.
+                    if !self.state.hidden && !self.state.deleted {
+                        self.inlines.push(Inline::LineBreak);
+                    }
                 } else if !self.state.suppress {
                     self.end_paragraph()?;
                 }
@@ -823,7 +864,7 @@ impl<'a> Parser<'a> {
             // boundary they carry is not.
             "line" | "lbr" | "page" | "column" => {
                 self.flush_pending();
-                if !self.state.suppress {
+                if self.text_visible() {
                     self.inlines.push(Inline::LineBreak);
                 }
             }
@@ -989,8 +1030,10 @@ impl<'a> Parser<'a> {
             "result" => self.state.suppress = false,
             "pict" => {
                 // A pict inside a suppressed destination (the nonshppict
-                // fallback, excluded headers) is not extracted.
-                if !self.state.suppress {
+                // fallback, excluded headers) is not extracted; nor is one
+                // inside hidden (`\v`) or tracked-deletion (`\deleted`) text,
+                // matching how the rest of that run's content is dropped.
+                if self.text_visible() {
                     self.flush_pending();
                     self.state.capture = Capture::Pict;
                     self.dest.pict =
@@ -1015,7 +1058,12 @@ impl<'a> Parser<'a> {
             if word != "mmath" {
                 return false;
             }
-            if !self.state.suppress {
+            // A math zone opened inside hidden (`\v`) or tracked-deletion
+            // (`\deleted`) text is not captured either: with no `MathState`
+            // the inner `\m*` words fall through unrecognized, and the
+            // zone's plain text then reaches `push_text`, which drops it as
+            // hidden/deleted like any other run.
+            if self.text_visible() {
                 self.flush_pending();
                 self.state.capture = Capture::Math;
                 self.dest.math = Some(MathState::new(self.stack.len()));
@@ -1151,9 +1199,31 @@ impl<'a> Parser<'a> {
                 }
             }
             Capture::None => {
-                if !self.state.suppress {
-                    self.inlines.push(Inline::Text { text, style: self.state.style });
+                if self.state.suppress {
+                    return;
                 }
+                // Hidden (\v) and tracked-deletion (\deleted) text is
+                // dropped with no option, matching DOCX's treatment of
+                // tracked deletions.
+                if self.state.hidden || self.state.deleted {
+                    self.hidden_drop_pending = true;
+                    return;
+                }
+                let mut text = text;
+                if std::mem::take(&mut self.hidden_drop_pending)
+                    && self.inlines.last().is_some_and(
+                        |i| matches!(i, Inline::Text { text: t, .. } if t.ends_with([' ', '\t'])),
+                    )
+                {
+                    // A real space or tab already sits on the near side of
+                    // the run that got dropped; without this the same
+                    // whitespace surviving on this side would double up.
+                    text = text.trim_start_matches([' ', '\t']).to_string();
+                    if text.is_empty() {
+                        return;
+                    }
+                }
+                self.inlines.push(Inline::Text { text, style: self.state.style });
             }
         }
     }
@@ -1169,6 +1239,7 @@ impl<'a> Parser<'a> {
 
     fn end_paragraph(&mut self) -> Result<(), ConvertError> {
         let inlines = std::mem::take(&mut self.inlines);
+        self.hidden_drop_pending = false;
         let listtext = self.dest.listtext.take();
         let math_display = std::mem::take(&mut self.dest.math_display);
 
@@ -1403,6 +1474,104 @@ mod tests {
         .unwrap();
         assert_eq!(doc.assets.len(), 1, "assets: {:?}", doc.assets);
         assert!(doc.assets[0].bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn hidden_text_is_dropped_with_correct_spacing() {
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 Visible {\v HIDDEN} after}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "Visible after\n");
+    }
+
+    #[test]
+    fn v_then_v0_inside_same_group_only_hides_the_first_run() {
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 {\v HIDDEN\v0 VISIBLE}}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "VISIBLE\n");
+    }
+
+    #[test]
+    fn deleted_text_is_dropped_while_revised_text_is_kept() {
+        let markdown = crate::to_markdown_bytes(
+            br"{\rtf1 {\deleted DELETED-RTF-TEXT}{\revised kept text}}",
+            crate::Format::Rtf,
+        )
+        .unwrap();
+        assert_eq!(markdown, "kept text\n");
+    }
+
+    #[test]
+    fn hidden_state_is_restored_after_the_group_closes() {
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 {\v HIDDEN}Visible}", crate::Format::Rtf).unwrap();
+        assert_eq!(markdown, "Visible\n");
+    }
+
+    #[test]
+    fn hidden_run_suppresses_line_breaks_too() {
+        // \line (and \lbr, \page, \column) push an inline line break
+        // directly onto the inline stream, bypassing the ordinary text
+        // path; they must still be gated by hidden/deleted like any other
+        // inline content produced from inside the run.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 A{\v hidden\line more}B}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "AB\n");
+    }
+
+    #[test]
+    fn plain_clears_hidden_state() {
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 {\v HIDDEN\plain VISIBLE}}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "VISIBLE\n");
+    }
+
+    #[test]
+    fn hidden_unicode_fallback_bytes_do_not_desync_following_text() {
+        // \uc1 means a \u escape is followed by one fallback byte; that
+        // fallback byte must still be consumed while hidden so it does not
+        // leak into the visible text that follows.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1\uc1 {\v \u9639 ?}Visible}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "Visible\n");
+    }
+
+    #[test]
+    fn hidden_math_zone_is_dropped_entirely() {
+        // The zone itself is not captured (no MathState), so its `\m*`
+        // control words fall through unrecognized and its plain text is
+        // dropped by push_text like any other hidden content, instead of
+        // reaching the document as a rendered `Inline::Math`.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1 A{\v {\mmath{\mr x}}}B}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "AB\n");
+    }
+
+    #[test]
+    fn hidden_pict_is_not_extracted_as_an_asset() {
+        let doc = parse(br"{\rtf1 A{\v {\pict\pngblip 89504e470d0a1a0a}}B}").unwrap();
+        assert!(doc.assets.is_empty(), "assets: {:?}", doc.assets);
+    }
+
+    #[test]
+    fn hidden_unicode_fallback_skip_survives_the_v0_boundary() {
+        // \uc2 arms a two-byte fallback skip per \u escape. Here only the
+        // first fallback byte lands before \v0 turns hidden text back off;
+        // the second lands after, while the run is visible again. The skip
+        // counter lives on the decoder, not on the per-group CharState, so
+        // it must still swallow that second byte instead of leaking it in
+        // front of "Visible". An implementation that stopped honoring the
+        // skip while hidden (or reset it at \v0) would render "YVisible" or
+        // eat into "Visible" itself.
+        let markdown =
+            crate::to_markdown_bytes(br"{\rtf1\uc2 {\v\u9639 XY\v0 Visible}}", crate::Format::Rtf)
+                .unwrap();
+        assert_eq!(markdown, "Visible\n");
     }
 
     #[test]
