@@ -364,9 +364,22 @@ fn slide_hidden(sld: &Element) -> bool {
 }
 
 /// A shape's own `<p:cNvPr hidden="1"|"true">`: hidden shapes are omitted
-/// with their descendants (fixed policy, no option).
+/// with their descendants (fixed policy, no option). Reads the `cNvPr`
+/// inside the shape's own non-visual properties block specifically -
+/// `p:grpSp`/`p:graphicFrame` (OLE frames) can nest a child shape carrying
+/// its own `cNvPr`, and a flat "first cNvPr anywhere under this element"
+/// search would consult the wrong one if a schema-noncompliant producer
+/// places child shapes before the non-visual properties block.
 fn shape_hidden(el: &Element) -> bool {
-    el.first_descendant(ns::P, "cNvPr")
+    el.child_elems()
+        .find(|c| {
+            c.ns.as_deref() == Some(ns::P)
+                && matches!(
+                    c.local.as_str(),
+                    "nvSpPr" | "nvCxnSpPr" | "nvGrpSpPr" | "nvGraphicFramePr" | "nvPicPr"
+                )
+        })
+        .and_then(|nv| nv.find(ns::P, "cNvPr"))
         .is_some_and(|c| matches!(c.attr(ns::P, "hidden"), Some("1") | Some("true")))
 }
 
@@ -376,6 +389,12 @@ fn shape_hidden(el: &Element) -> bool {
 /// a child's own `cNvPr` is not itself marked hidden.
 fn collect_notes_shapes<'a>(parent: &'a Element, out: &mut Vec<&'a Element>) {
     for child in parent.child_elems() {
+        if child.is(ns::MC, "AlternateContent") {
+            if let Some(branch) = crate::shared::mc::alternate_branch(child, SUPPORTED_NS) {
+                collect_notes_shapes(branch, out);
+            }
+            continue;
+        }
         if child.ns.as_deref().is_none_or(|n| n != ns::P) {
             continue;
         }
@@ -850,6 +869,38 @@ mod tests {
     }
 
     #[test]
+    fn group_shape_hidden_flag_reads_its_own_non_visual_block_not_a_childs() {
+        // Schema-noncompliant order: a child `p:sp` (with its own `cNvPr`)
+        // appears before the group's own `p:nvGrpSpPr`. The group's hidden
+        // state must come from its own `cNvPr`, not the first `cNvPr`
+        // anywhere under it in document order.
+        let group = r#"<p:grpSp>
+            <p:sp><p:nvSpPr><p:cNvPr id="10" name="First child" hidden="1"/><p:cNvSpPr/>
+            <p:nvPr/></p:nvSpPr><p:spPr/>
+            <p:txBody><a:bodyPr/><a:p><a:r><a:t>Group first child text</a:t></a:r></a:p></p:txBody></p:sp>
+            <p:nvGrpSpPr><p:cNvPr id="9" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            <p:sp><p:nvSpPr><p:cNvPr id="11" name="Second child"/><p:cNvSpPr/>
+            <p:nvPr/></p:nvSpPr><p:spPr/>
+            <p:txBody><a:bodyPr/><a:p><a:r><a:t>Group second child text</a:t></a:r></a:p></p:txBody></p:sp>
+            </p:grpSp>"#;
+        let slide = slide_xml(false, group);
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1"])),
+            ("ppt/_rels/presentation.xml.rels", &pres_rels(&[("rId1", "slides/slide1.xml")])),
+            ("ppt/slides/slide1.xml", &slide),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(!text.contains("Group first child text"), "hidden child text leaked: {text}");
+        assert!(
+            text.contains("Group second child text"),
+            "visible group must not vanish because a child's own cNvPr precedes the group's: {text}"
+        );
+    }
+
+    #[test]
     fn notes_blockquote_begins_with_bold_label() {
         let slide = slide_xml(false, &text_shape(2, "Content", "Slide body", false));
         let notes_rels = r#"<Relationships
@@ -939,6 +990,55 @@ mod tests {
             "hidden group child leaked in notes: {text}"
         );
         assert!(text.contains("Visible note text"));
+    }
+
+    #[test]
+    fn notes_shape_wrapped_in_alternate_content_is_still_collected() {
+        // PowerPoint wraps a notes shape containing a14 markup (e.g. math)
+        // in `mc:AlternateContent`; the supported `mc:Choice` branch must
+        // still be walked for notes shapes, same as the slide path.
+        let slide = slide_xml(false, &text_shape(2, "Content", "Slide body", false));
+        let notes_rels = r#"<Relationships
+            xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+                Target="../notesSlides/notesSlide1.xml"/>
+            </Relationships>"#;
+        let notes = format!(
+            r#"<p:notes {NS}
+            xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+            xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">
+            <p:cSld><p:spTree>
+            <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            <mc:AlternateContent>
+            <mc:Choice Requires="a14">
+            {}
+            </mc:Choice>
+            <mc:Fallback>
+            {}
+            </mc:Fallback>
+            </mc:AlternateContent>
+            </p:spTree></p:cSld>
+            </p:notes>"#,
+            text_shape(2, "Choice", "Alt choice note text", false),
+            text_shape(2, "Fallback", "Fallback note text", false),
+        );
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1"])),
+            ("ppt/_rels/presentation.xml.rels", &pres_rels(&[("rId1", "slides/slide1.xml")])),
+            ("ppt/slides/slide1.xml", &slide),
+            ("ppt/slides/_rels/slide1.xml.rels", notes_rels),
+            ("ppt/notesSlides/notesSlide1.xml", &notes),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(
+            text.contains("Alt choice note text"),
+            "supported mc:Choice branch dropped: {text}"
+        );
+        assert!(!text.contains("Fallback note text"));
     }
 
     #[test]
