@@ -363,6 +363,25 @@ fn ordinary_relative_targets_keep_the_link() {
         target: LinkTarget::Relative("chapter2.xhtml#top".into()),
     }])]);
     assert_eq!(md, "[ch2](chapter2.xhtml#top)\n");
+    let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+        content: vec![Inline::plain("rel")],
+        target: LinkTarget::Relative("a/b:c".into()),
+    }])]);
+    assert_eq!(md, "[rel](a/b:c)\n");
+}
+
+#[test]
+fn disguised_scheme_bearing_relative_targets_degrade_to_plain_label() {
+    // A leading space keeps `is_absolute_uri` from ever classifying these as
+    // External, and `/\`/`\/` is protocol-relative to a WHATWG URL parser
+    // just like `//`; all four must still lose their destination.
+    for target in [" javascript:alert(1)", " //evil/x", r"/\evil/x", r"\/evil/x"] {
+        let md = doc(vec![Block::Paragraph(vec![Inline::Link {
+            content: vec![Inline::plain("click")],
+            target: LinkTarget::Relative(target.into()),
+        }])]);
+        assert_eq!(md, "click\n", "target {target}");
+    }
 }
 
 #[test]

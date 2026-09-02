@@ -318,11 +318,31 @@ pub(crate) fn url_scheme_allowed(url: &str) -> bool {
 }
 
 /// Whether a scheme-less relative reference is actually confined to being
-/// relative: not a UNC path (`\\server\share`) or a protocol-relative URL
-/// (`//host/path`), both of which resolve outside the document the same way
-/// an absolute URL with a scheme would.
+/// relative. Frontends hand `href`/target values through untrimmed, so a
+/// leading space or control character (which browsers strip before
+/// resolving a URL, and which `is_absolute_uri` does not recognize as
+/// starting a scheme) is stripped first. What remains is rejected if it
+/// opens with two `/`/`\` characters in any combination — a UNC path
+/// (`\\server\share`), a protocol-relative URL (`//host/path`), or the
+/// `/\`/`\/` variants the WHATWG URL parser also treats as protocol-relative
+/// for special schemes — or if a `:` appears before the first `/`, `\`, `?`
+/// or `#`, which a genuine relative reference can never contain in its first
+/// segment and which otherwise lets a scheme-bearing target (e.g.
+/// `javascript:`) hide behind the leading whitespace that routed it here
+/// instead of through [`url_scheme_allowed`].
 pub(crate) fn relative_target_allowed(url: &str) -> bool {
-    !url.starts_with(r"\\") && !url.starts_with("//")
+    let trimmed = url.trim_start_matches(|c: char| c <= ' ');
+    let mut chars = trimmed.chars();
+    let first = chars.next();
+    let second = chars.next();
+    if matches!(first, Some('/' | '\\')) && matches!(second, Some('/' | '\\')) {
+        return false;
+    }
+    let has_colon_first_segment = match trimmed.find(['/', '\\', '?', '#']) {
+        Some(idx) => trimmed[..idx].contains(':'),
+        None => trimmed.contains(':'),
+    };
+    !has_colon_first_segment
 }
 
 /// Neutralizes HTML markup inside math source without changing its TeX
@@ -413,6 +433,24 @@ mod tests {
     fn ordinary_relative_targets_allowed() {
         assert!(relative_target_allowed("../x.html"));
         assert!(relative_target_allowed("chapter2.xhtml#top"));
+        assert!(relative_target_allowed("a/b:c"));
+    }
+
+    #[test]
+    fn whitespace_prefixed_scheme_bearing_targets_rejected() {
+        // A leading space keeps `is_absolute_uri` from classifying these as
+        // External, but they are still scheme-bearing and must not slip
+        // through as a bare relative reference.
+        assert!(!relative_target_allowed(" javascript:alert(1)"));
+        assert!(!relative_target_allowed(" //evil/x"));
+    }
+
+    #[test]
+    fn mixed_slash_backslash_protocol_relative_targets_rejected() {
+        // The WHATWG URL parser treats `\` as `/` for special schemes, so
+        // these resolve as protocol-relative just like `//evil/x`.
+        assert!(!relative_target_allowed(r"/\evil/x"));
+        assert!(!relative_target_allowed(r"\/evil/x"));
     }
 
     #[test]
