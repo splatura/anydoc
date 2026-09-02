@@ -1,7 +1,9 @@
 //! OOXML PresentationML (.pptx / .pptm / .ppsx): slides in `sldIdLst` order,
 //! with the full text cascade - slide -> layout -> master placeholder /
 //! `txStyles` -> presentation defaults. Speaker notes are included (fixed
-//! policy), rendered as a quote after each slide's content.
+//! policy), rendered as a labelled quote after each slide's content. Hidden
+//! slides (`<p:sld show="0">`) and hidden shapes (`<p:cNvPr hidden="1">`) are
+//! omitted entirely, with no option to keep them.
 
 mod cascade;
 
@@ -126,11 +128,19 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
                 continue;
             }
         };
-        let Some(sp_tree) = tree
-            .find(ns::P, "sld")
-            .and_then(|s| s.find(ns::P, "cSld"))
-            .and_then(|c| c.find(ns::P, "spTree"))
-        else {
+        let Some(sld) = tree.find(ns::P, "sld") else {
+            log::warn!("skipping slide {slide_path}: no shape tree");
+            failed += 1;
+            continue;
+        };
+        if slide_hidden(sld) {
+            // Hidden slides (and their speaker notes) are omitted entirely
+            // (fixed policy, no option). This is not a read failure, so it
+            // never counts toward the all-failed check below: an all-hidden
+            // deck converts to an empty document, not an error.
+            continue;
+        }
+        let Some(sp_tree) = sld.find(ns::P, "cSld").and_then(|c| c.find(ns::P, "spTree")) else {
             log::warn!("skipping slide {slide_path}: no shape tree");
             failed += 1;
             continue;
@@ -192,10 +202,15 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
             };
             let mut notes_blocks = Vec::new();
             for sp in notes_tree.descendants(ns::P, "sp") {
-                // Keep note text bodies (real producers use a body
-                // placeholder; LibreOffice writes plain text boxes) but skip
-                // the slide-image and chrome placeholders.
-                if matches!(placeholder_type(sp), Some("sldImg" | "sldNum" | "hdr" | "ftr" | "dt"))
+                // Hidden shapes are omitted (fixed policy, no option). Keep
+                // note text bodies (real producers use a body placeholder;
+                // LibreOffice writes plain text boxes) but skip the
+                // slide-image and chrome placeholders.
+                if shape_hidden(sp)
+                    || matches!(
+                        placeholder_type(sp),
+                        Some("sldImg" | "sldNum" | "hdr" | "ftr" | "dt")
+                    )
                 {
                     continue;
                 }
@@ -204,7 +219,14 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
                 }
             }
             if !notes_blocks.is_empty() {
-                blocks.push(Block::BlockQuote(notes_blocks));
+                // Labelled so a reader can tell notes from slide text.
+                let label = Block::Paragraph(vec![Inline::Text {
+                    text: "Speaker notes".to_string(),
+                    style: Style { bold: true, ..Style::PLAIN },
+                }]);
+                let mut quote = vec![label];
+                quote.extend(notes_blocks);
+                blocks.push(Block::BlockQuote(quote));
             }
         }
     }
@@ -329,6 +351,19 @@ fn placeholder_type(sp: &Element) -> Option<&str> {
     sp.first_descendant(ns::P, "ph").map(|ph| ph.attr(ns::P, "type").unwrap_or("body"))
 }
 
+/// `<p:sld show="0"|"false">`: excluded from the slide show, so its content
+/// (and its speaker notes) is omitted entirely (fixed policy, no option).
+fn slide_hidden(sld: &Element) -> bool {
+    matches!(sld.attr(ns::P, "show"), Some("0") | Some("false"))
+}
+
+/// A shape's own `<p:cNvPr hidden="1"|"true">`: hidden shapes are omitted
+/// with their descendants (fixed policy, no option).
+fn shape_hidden(el: &Element) -> bool {
+    el.first_descendant(ns::P, "cNvPr")
+        .is_some_and(|c| matches!(c.attr(ns::P, "hidden"), Some("1") | Some("true")))
+}
+
 fn parse_shapes(
     parent: &Element,
     ctx: &SlideCtx,
@@ -342,6 +377,13 @@ fn parse_shapes(
             continue;
         }
         if child.ns.as_deref().is_none_or(|n| n != ns::P) {
+            continue;
+        }
+        // Hidden shapes are omitted with their descendants (fixed policy,
+        // no option).
+        if matches!(child.local.as_str(), "sp" | "cxnSp" | "grpSp" | "graphicFrame" | "pic")
+            && shape_hidden(child)
+        {
             continue;
         }
         match child.local.as_str() {
@@ -649,4 +691,200 @@ fn parse_table(tbl: &Element, ctx: &SlideCtx, blocks: &mut Vec<Block>) -> Result
     table.header_rows = resolve_header_rows(&table, header_rows);
     blocks.push(Block::Table(table));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn pptx_parts(parts: &[(&str, &str)]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, body) in parts {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    const NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+        xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    const ROOT_RELS: &str = r#"<Relationships
+        xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        <Relationship Id="rId1"
+            Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+            Target="ppt/presentation.xml"/>
+        </Relationships>"#;
+
+    fn text_shape(id: u32, name: &str, text: &str, hidden: bool) -> String {
+        let hidden_attr = if hidden { r#" hidden="1""# } else { "" };
+        format!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="{name}"{hidden_attr}/><p:cNvSpPr/>
+            <p:nvPr/></p:nvSpPr><p:spPr/>
+            <p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"#
+        )
+    }
+
+    fn slide_xml(hidden: bool, body_shapes: &str) -> String {
+        let show = if hidden { r#" show="0""# } else { "" };
+        format!(
+            r#"<p:sld {NS}{show}>
+            <p:cSld><p:spTree>
+            <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            {body_shapes}
+            </p:spTree></p:cSld>
+            </p:sld>"#
+        )
+    }
+
+    fn presentation_xml(rids: &[&str]) -> String {
+        let entries: String = rids
+            .iter()
+            .enumerate()
+            .map(|(i, rid)| format!(r#"<p:sldId id="{}" r:id="{rid}"/>"#, 256 + i))
+            .collect();
+        format!(r#"<p:presentation {NS}><p:sldIdLst>{entries}</p:sldIdLst></p:presentation>"#)
+    }
+
+    fn pres_rels(targets: &[(&str, &str)]) -> String {
+        let rels: String = targets
+            .iter()
+            .map(|(rid, target)| {
+                format!(
+                    r#"<Relationship Id="{rid}"
+                    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
+                    Target="{target}"/>"#
+                )
+            })
+            .collect();
+        format!(
+            r#"<Relationships
+            xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
+        )
+    }
+
+    /// Plain text of every paragraph, slide content and speaker notes alike,
+    /// in document order - enough to assert presence/absence of a phrase.
+    fn all_text(blocks: &[Block]) -> String {
+        blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(inlines) => crate::model::inlines_to_plain_text(inlines),
+                Block::BlockQuote(inner) => all_text(inner),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn hidden_slide_is_skipped_while_next_slide_is_kept() {
+        let slide1 = slide_xml(true, &text_shape(2, "Content", "Hidden slide text", false));
+        let slide2 = slide_xml(false, &text_shape(2, "Content", "Visible slide text", false));
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1", "rId2"])),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                &pres_rels(&[("rId1", "slides/slide1.xml"), ("rId2", "slides/slide2.xml")]),
+            ),
+            ("ppt/slides/slide1.xml", &slide1),
+            ("ppt/slides/slide2.xml", &slide2),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(!text.contains("Hidden slide text"), "hidden slide text leaked: {text}");
+        assert!(text.contains("Visible slide text"));
+    }
+
+    #[test]
+    fn hidden_shape_is_skipped_while_sibling_shape_is_kept() {
+        let shapes = format!(
+            "{}{}",
+            text_shape(2, "Hidden", "Hidden shape text", true),
+            text_shape(3, "Visible", "Visible shape text", false)
+        );
+        let slide = slide_xml(false, &shapes);
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1"])),
+            ("ppt/_rels/presentation.xml.rels", &pres_rels(&[("rId1", "slides/slide1.xml")])),
+            ("ppt/slides/slide1.xml", &slide),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let text = all_text(&doc.blocks);
+        assert!(!text.contains("Hidden shape text"), "hidden shape text leaked: {text}");
+        assert!(text.contains("Visible shape text"));
+    }
+
+    #[test]
+    fn notes_blockquote_begins_with_bold_label() {
+        let slide = slide_xml(false, &text_shape(2, "Content", "Slide body", false));
+        let notes_rels = r#"<Relationships
+            xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+                Target="../notesSlides/notesSlide1.xml"/>
+            </Relationships>"#;
+        let notes = format!(
+            r#"<p:notes {NS}>
+            <p:cSld><p:spTree>
+            <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            <p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr/>
+            <p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>
+            <p:txBody><a:bodyPr/><a:p><a:r><a:t>Note body text</a:t></a:r></a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld>
+            </p:notes>"#
+        );
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1"])),
+            ("ppt/_rels/presentation.xml.rels", &pres_rels(&[("rId1", "slides/slide1.xml")])),
+            ("ppt/slides/slide1.xml", &slide),
+            ("ppt/slides/_rels/slide1.xml.rels", notes_rels),
+            ("ppt/notesSlides/notesSlide1.xml", &notes),
+        ]);
+        let doc = parse(&bytes).unwrap();
+        let quote = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::BlockQuote(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("speaker notes rendered as a blockquote");
+        let Some(Block::Paragraph(inlines)) = quote.first() else {
+            panic!("blockquote does not start with a label paragraph: {quote:?}");
+        };
+        assert_eq!(inlines.len(), 1);
+        let Inline::Text { text, style } = &inlines[0] else {
+            panic!("label is not plain text: {inlines:?}");
+        };
+        assert_eq!(text, "Speaker notes");
+        assert!(style.bold, "speaker notes label must be bold");
+        assert!(all_text(quote).contains("Note body text"));
+    }
+
+    #[test]
+    fn all_hidden_deck_converts_to_an_empty_document_without_error() {
+        let slide1 = slide_xml(true, &text_shape(2, "Content", "One", false));
+        let slide2 = slide_xml(true, &text_shape(2, "Content", "Two", false));
+        let bytes = pptx_parts(&[
+            ("_rels/.rels", ROOT_RELS),
+            ("ppt/presentation.xml", &presentation_xml(&["rId1", "rId2"])),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                &pres_rels(&[("rId1", "slides/slide1.xml"), ("rId2", "slides/slide2.xml")]),
+            ),
+            ("ppt/slides/slide1.xml", &slide1),
+            ("ppt/slides/slide2.xml", &slide2),
+        ]);
+        let doc = parse(&bytes).expect("an all-hidden deck is an empty document, not an error");
+        assert!(doc.blocks.is_empty());
+    }
 }
