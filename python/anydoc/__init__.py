@@ -3,6 +3,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from importlib.metadata import PackageNotFoundError, version
@@ -103,6 +104,35 @@ _API_URL = "https://api.firecrawl.dev"
 _TIMEOUT_SECONDS = 300
 
 
+class _RedirectRefused(Exception):
+    """Raised by `_NoRedirectHandler` instead of following a 3xx response."""
+
+    def __init__(self, code: int, location: str):
+        super().__init__(f"redirected ({code}) to {location}")
+        self.code = code
+        self.location = location
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect so the Authorization header can never reach a
+    second origin. Passing an instance to `build_opener` replaces its
+    default `HTTPRedirectHandler`, which would otherwise follow 301/302/303
+    on a POST by resending it as a GET carrying every header but
+    Content-Length/Content-Type. 307/308 are refused here too for
+    consistency, though stock urllib already raises for those on a POST."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
+        raise _RedirectRefused(code, newurl)
+
+
+# install_opener() is deliberately not consulted here: urlopen would honour
+# an opener an embedding application installed globally (proxy auth, custom
+# CA handling, ...), but that would also let such a third-party opener
+# reintroduce redirect following, so this module always builds its own.
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 # The whole document goes, not only the pages that need OCR: Parse has no
 # page selection.
 def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "str | None") -> str:
@@ -119,13 +149,24 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+        # Unredirected so urllib never copies it onto a redirect target, even
+        # if a future change replaces `_OPENER`'s refusal with following it.
+        request.add_unredirected_header("Authorization", f"Bearer {api_key}")
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
+        with _OPENER.open(request, timeout=_TIMEOUT_SECONDS) as response:
             status, reply = response.status, _json(response.read())
+    except _RedirectRefused as error:
+        host = _redirect_host(error.location)
+        raise HostedError(
+            f"Firecrawl Parse redirected the request to {host}; refusing to follow"
+        ) from error
     except urllib.error.HTTPError as error:
         status, reply = error.code, _json(error.read())
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # ValueError alongside OSError: a malformed redirect Location (e.g.
+        # unbalanced IPv6 brackets) makes urllib's own urlparse raise before
+        # `_NoRedirectHandler.redirect_request` is ever reached, so it never
+        # becomes a `_RedirectRefused` -- still surface it as a HostedError.
         raise HostedError(f"Firecrawl Parse: {error}") from error
     if status != 200 or not reply.get("success"):
         detail = reply.get("error") or f"HTTP {status}"
@@ -135,6 +176,22 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     if not isinstance(markdown, str) or not markdown:
         raise HostedError("Firecrawl Parse returned no Markdown")
     return markdown if markdown.endswith("\n") else markdown + "\n"
+
+
+def _redirect_host(location: str) -> str:
+    """The host:port a redirect `Location` names, without any userinfo it
+    might carry (the message only intends to name a host, not credentials
+    an attacker-controlled response happened to include)."""
+    fallback = "an unparseable Location"
+    try:
+        parts = urllib.parse.urlsplit(location)
+        fallback = parts.netloc.rpartition("@")[2] or fallback
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return fallback
+    if not host:
+        return fallback
+    return f"{host}:{port}" if port else host
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:
