@@ -7,10 +7,12 @@ import os
 import re
 import threading
 import unittest
+import urllib.request
 import zipfile
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 import anydoc
 
@@ -211,6 +213,16 @@ class AnydocTest(unittest.TestCase):
             with self.assertRaisesRegex(anydoc.HostedError, redirected):
                 anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
             self.assertEqual(target_hits, [])
+
+    def test_the_authorization_header_is_unredirected_even_without_the_refusing_opener(self):
+        """Isolates the belt from the braces: with `_NoRedirectHandler`
+        swapped out for a stock opener that follows the redirect, the
+        Authorization header set via `add_unredirected_header` must still
+        not reach the target -- only `(method, None)` should be recorded."""
+        with redirect_stub(302) as (api_url, _target_host, target_hits):
+            with mock.patch.object(anydoc, "_OPENER", urllib.request.build_opener()):
+                anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
+            self.assertEqual(target_hits, [("GET", None)])
 
     def test_unreadable_files_and_bad_arguments_raise_the_python_exception(self):
         with self.assertRaises(FileNotFoundError):

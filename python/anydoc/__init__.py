@@ -126,6 +126,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise _RedirectRefused(code, newurl)
 
 
+# install_opener() is deliberately not consulted here: urlopen would honour
+# an opener an embedding application installed globally (proxy auth, custom
+# CA handling, ...), but that would also let such a third-party opener
+# reintroduce redirect following, so this module always builds its own.
 _OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
@@ -158,7 +162,11 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
         ) from error
     except urllib.error.HTTPError as error:
         status, reply = error.code, _json(error.read())
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # ValueError alongside OSError: a malformed redirect Location (e.g.
+        # unbalanced IPv6 brackets) makes urllib's own urlparse raise before
+        # `_NoRedirectHandler.redirect_request` is ever reached, so it never
+        # becomes a `_RedirectRefused` -- still surface it as a HostedError.
         raise HostedError(f"Firecrawl Parse: {error}") from error
     if status != 200 or not reply.get("success"):
         detail = reply.get("error") or f"HTTP {status}"
@@ -174,13 +182,15 @@ def _redirect_host(location: str) -> str:
     """The host:port a redirect `Location` names, without any userinfo it
     might carry (the message only intends to name a host, not credentials
     an attacker-controlled response happened to include)."""
+    fallback = "an unparseable Location"
     try:
         parts = urllib.parse.urlsplit(location)
+        fallback = parts.netloc.rpartition("@")[2] or fallback
         host, port = parts.hostname, parts.port
     except ValueError:
-        return location
+        return fallback
     if not host:
-        return location
+        return fallback
     return f"{host}:{port}" if port else host
 
 
