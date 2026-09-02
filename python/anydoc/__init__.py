@@ -3,6 +3,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from importlib.metadata import PackageNotFoundError, version
@@ -103,6 +104,28 @@ _API_URL = "https://api.firecrawl.dev"
 _TIMEOUT_SECONDS = 300
 
 
+class _RedirectRefused(Exception):
+    """Raised by `_NoRedirectHandler` instead of following a 3xx response."""
+
+    def __init__(self, code: int, location: str):
+        super().__init__(f"redirected ({code}) to {location}")
+        self.code = code
+        self.location = location
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect so the Authorization header can never reach a
+    second origin. Passing an instance to `build_opener` replaces its
+    default `HTTPRedirectHandler`, which would otherwise follow 301/302/303
+    (and, since the request is a POST, resend the header on 307/308 too)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _RedirectRefused(code, newurl)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 # The whole document goes, not only the pages that need OCR: Parse has no
 # page selection.
 def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "str | None") -> str:
@@ -119,10 +142,17 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+        # Unredirected so urllib never copies it onto a redirect target, even
+        # if a future change replaces `_OPENER`'s refusal with following it.
+        request.add_unredirected_header("Authorization", f"Bearer {api_key}")
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
+        with _OPENER.open(request, timeout=_TIMEOUT_SECONDS) as response:
             status, reply = response.status, _json(response.read())
+    except _RedirectRefused as error:
+        host = urllib.parse.urlsplit(error.location).netloc or error.location
+        raise HostedError(
+            f"Firecrawl Parse redirected the request to {host}; refusing to follow"
+        ) from error
     except urllib.error.HTTPError as error:
         status, reply = error.code, _json(error.read())
     except OSError as error:

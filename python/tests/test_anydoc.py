@@ -61,6 +61,52 @@ def hosted_stub(status, body):
                 os.environ[name] = value
 
 
+@contextmanager
+def redirect_stub(status):
+    """Two loopback stubs. The second would serve a normal hosted reply, but
+    should never be asked: the first answers every POST with a `status`
+    redirect to it. Yields the first stub's `api_url` and the second stub's
+    hit count, so a test can assert the second stub was never reached."""
+    target_hits = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            target_hits.append(self.headers.get("Authorization"))
+            reply = json.dumps({"success": True, "data": {"markdown": HOSTED_MARKDOWN}}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    target = HTTPServer(("127.0.0.1", 0), TargetHandler)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+
+    class FrontHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(status)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/v2/parse")
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    front = HTTPServer(("127.0.0.1", 0), FrontHandler)
+    threading.Thread(target=front.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{front.server_port}", target_hits
+    finally:
+        for server in (front, target):
+            server.shutdown()
+            server.server_close()
+
+
 class AnydocTest(unittest.TestCase):
     def test_to_markdown_detects_the_format_from_the_file_content(self):
         markdown = anydoc.to_markdown(OUTLINE)
@@ -145,6 +191,18 @@ class AnydocTest(unittest.TestCase):
         with hosted_stub(429, {"success": False, "error": "Rate limit exceeded"}):
             with self.assertRaisesRegex(anydoc.HostedError, "set FIRECRAWL_API_KEY"):
                 anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted")
+
+    def test_a_302_redirect_is_refused_and_the_api_key_never_reaches_the_target(self):
+        with redirect_stub(302) as (api_url, target_hits):
+            with self.assertRaisesRegex(anydoc.HostedError, "redirected"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
+            self.assertEqual(target_hits, [])
+
+    def test_a_307_redirect_is_refused_and_the_api_key_never_reaches_the_target(self):
+        with redirect_stub(307) as (api_url, target_hits):
+            with self.assertRaisesRegex(anydoc.HostedError, "redirected"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes(), ocr="hosted", api_key="SECRET", api_url=api_url)
+            self.assertEqual(target_hits, [])
 
     def test_unreadable_files_and_bad_arguments_raise_the_python_exception(self):
         with self.assertRaises(FileNotFoundError):

@@ -46,7 +46,7 @@ document = anydoc.to_document(data)
 
 ## Scanned pages
 
-anydoc converts locally and does not do OCR, so a PDF with scanned or image-only pages raises `NeedsOcrError`. Opt in with `ocr="hosted"` to send that document to [Firecrawl Parse](https://firecrawl.dev/parse). No signup needed. Set `api_key` or `FIRECRAWL_API_KEY` for higher limits.
+anydoc converts locally and does not do OCR, so a PDF with scanned or image-only pages raises `NeedsOcrError`. Opt in with `ocr="hosted"` to send that document to [Firecrawl Parse](https://firecrawl.dev/parse). No signup needed. Set `api_key` or `FIRECRAWL_API_KEY` for higher limits. A redirect from the Parse endpoint is refused rather than followed, so the API key can never reach another host.
 
 ```python
 markdown = anydoc.to_markdown("scan.pdf", ocr="hosted")
