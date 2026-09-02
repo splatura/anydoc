@@ -709,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn a_footnote_reference_nested_in_a_text_box_inside_a_hidden_run_is_dropped_entirely() {
+        // A note reference can sit arbitrarily deep under a hidden run's
+        // w:drawing (wps:txbx/w:txbxContent), not just as a direct child:
+        // the shallow field-marker walk used for hidden runs must still
+        // find it so the note body doesn't survive as an unreferenced
+        // trailing note. Word itself refuses to place footnotes inside
+        // text boxes, but a crafted file can still reach this path.
+        let document = format!(
+            r#"<w:document {W}
+            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            <w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:drawing><wps:txbx><w:txbxContent>
+                <w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
+            </w:txbxContent></wps:txbx></w:drawing></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let doc = parse(&footnotes_docx(&document, "HIDDEN-TEXTBOX-BODY")).unwrap();
+        assert!(doc.notes.iter().all(|n| n.id != "fn1"), "{:?}", doc.notes);
+        let markdown = crate::render::markdown::document_to_markdown(&doc);
+        assert!(!markdown.contains("[^"), "{markdown:?}");
+        assert!(!markdown.contains("HIDDEN-TEXTBOX-BODY"), "{markdown:?}");
+    }
+
+    #[test]
     fn a_footnote_referenced_once_hidden_and_once_visibly_is_kept() {
         let document = format!(
             r#"<w:document {W}><w:body><w:p>

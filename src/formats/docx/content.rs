@@ -10,7 +10,10 @@
 //! bubbles up through nested hyperlinks/fldSimple so the check sees a drop
 //! at any depth. A footnote/endnote reference dropped with its hidden run
 //! or tracked deletion is recorded so `docx::mod` can prune the note body
-//! unless a visible reference to the same id survives.
+//! unless a visible reference to the same id survives - including a
+//! reference nested arbitrarily deep under a hidden run's text box
+//! (`w:drawing`/`wps:txbx` or `w:pict`/`v:textbox`), not just one that is
+//! a direct child of the run.
 
 use crate::error::ConvertError;
 use crate::formats::docx::numbering::{Counters, Numbering};
@@ -567,6 +570,23 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
             // reason, so this keeps the two frontends consistent.
             self.dropped_hidden = true;
             self.walk_run_structure(run);
+            // A note reference can sit arbitrarily deep under a text box
+            // (`w:drawing`/`wps:txbx` or `w:pict`/`v:textbox`, both wrapping
+            // `w:txbxContent`), not just as a direct child of the run, so
+            // walk_run_structure's shallow field-marker walk won't see it.
+            // Word itself refuses to place footnotes inside text boxes, but
+            // record any nested reference defensively so a crafted file's
+            // note body is still pruned rather than surviving as an
+            // unreferenced trailing note. The text box's own field markers
+            // are deliberately not walked here - they belong to its own
+            // paragraph walker (`walk_drawing` -> `parse_blocks`) when the
+            // run isn't hidden, not to this run's field-frame stack.
+            for note_ref in run
+                .descendants(ns::W, "footnoteReference")
+                .chain(run.descendants(ns::W, "endnoteReference"))
+            {
+                self.record_hidden_note_ref(note_ref);
+            }
             return Ok(());
         }
         self.walk_run_content(run, style)
