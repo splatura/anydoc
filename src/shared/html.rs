@@ -15,8 +15,11 @@
 //! (`tag.class`, `tag#id`, `#id.class`, ...). Everything else - descendant,
 //! child, and sibling combinators (`div p`, `div > p`, `p ~ span`),
 //! pseudo-classes/elements (`p:first-child`), the universal selector (`*`),
-//! and any attribute selector besides the two above (`[data-x]`) - is
-//! skipped whole, never partially matched.
+//! any attribute selector besides the two above (`[data-x]`), and any
+//! at-rule (`@media`, `@supports`, `@import`, or any other nested block) -
+//! is skipped whole, never partially matched: [`Stylesheet::add`] has no
+//! notion of nesting, so an at-rule's inner block is never reached as a
+//! selector/declaration pair and its declarations never take effect.
 //!
 //! Author-hidden content is dropped, with no option to keep it: `display:
 //! none`, `visibility: hidden`/`collapse`, `opacity: 0` (numeric zero in any
@@ -245,9 +248,12 @@ struct ParsedSelector {
 /// Parse one compound selector's supported components, or `None` when it
 /// uses anything outside the subset (a combinator, a pseudo-class, an
 /// attribute selector other than the two in [`AttrSelector`], two selectors
-/// of the same kind, ...). `s` must already be a single trimmed, non-empty
-/// selector with no whitespace (a combinator is out of scope the moment it
-/// splits the selector into more than one word).
+/// of the same kind, whitespace inside an attribute selector's brackets
+/// (`[hidden ]`, `[aria-hidden = "true"]`) - valid CSS, but rejected along
+/// with everything else the leading whitespace check below skips, ...). `s`
+/// must already be a single trimmed, non-empty selector with no whitespace
+/// (a combinator is out of scope the moment it splits the selector into more
+/// than one word).
 fn parse_simple_selector(s: &str) -> Option<ParsedSelector> {
     if s.contains(':') || s.contains(char::is_whitespace) || s.contains(['>', '+', '~', '*']) {
         return None; // pseudo-classes/combinators/universal: out of subset
@@ -287,13 +293,18 @@ fn parse_simple_selector(s: &str) -> Option<ParsedSelector> {
                 if !body.ends_with(']') || attr.is_some() {
                     return None; // unterminated/duplicate attribute selector
                 }
-                let inner = body[..body.len() - 1].trim();
+                // No `.trim()` here: the whole selector was already
+                // rejected above if it contains any whitespace at all, so
+                // `inner` (and `name`/`value` below) can never carry any -
+                // `[hidden ]`/`[aria-hidden = "true"]` are out of the
+                // subset, not trimmed into matching.
+                let inner = &body[..body.len() - 1];
                 let matched = if inner.eq_ignore_ascii_case("hidden") {
                     Some(AttrSelector::Hidden)
                 } else {
                     inner.split_once('=').and_then(|(name, value)| {
-                        let value = value.trim().trim_matches(['"', '\'']);
-                        (name.trim().eq_ignore_ascii_case("aria-hidden")
+                        let value = value.trim_matches(['"', '\'']);
+                        (name.eq_ignore_ascii_case("aria-hidden")
                             && value.eq_ignore_ascii_case("true"))
                         .then_some(AttrSelector::AriaHiddenTrue)
                     })
@@ -316,11 +327,13 @@ impl Stylesheet {
     /// skipped: descendant/child/sibling combinators (`div p`, `div > p`,
     /// `p ~ span`), pseudo-classes/elements (`p:first-child`), the universal
     /// selector (`*`), any attribute selector other than the two above
-    /// (`[data-x]`), and a compound selector repeating the same kind of
-    /// component (`.a.b`, `#a#b`). `!important` declarations enter the
-    /// higher cascade tier. A selector list (`a, b`) is split on `,` and
-    /// each part is parsed and skipped independently, so one unsupported
-    /// part does not drop the others.
+    /// (`[data-x]`), a compound selector repeating the same kind of
+    /// component (`.a.b`, `#a#b`), and any at-rule (`@media`, `@supports`,
+    /// `@import`, or any other nested block) - this parser has no notion of
+    /// nesting, so an at-rule's inner declarations are never reached.
+    /// `!important` declarations enter the higher cascade tier. A selector
+    /// list (`a, b`) is split on `,` and each part is parsed and skipped
+    /// independently, so one unsupported part does not drop the others.
     pub fn add(&mut self, css: &str) {
         let css = strip_css_comments(css);
         for chunk in css.split('}') {
@@ -357,6 +370,15 @@ impl Stylesheet {
                 }
             }
         }
+    }
+
+    /// Number of rules parsed so far - a test-only hook to pin
+    /// [`parse_simple_selector`]'s behavior directly (whether a given
+    /// selector text produces a rule at all), independent of whether the
+    /// element it would match happens to be hidden some other way too.
+    #[cfg(test)]
+    fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 
     /// Matching rules for one element as (priority, props) pairs. `hidden`
@@ -651,6 +673,27 @@ impl Builder<'_> {
         props
     }
 
+    /// Whether `elem` resolves hidden, recording the drop in
+    /// [`Builder::dropped_hidden`] when it does. [`Builder::walk_elem`]'s own
+    /// early return records the drop itself since it already has `props` in
+    /// hand for [`Builder::merge_props`]; every other site that filters
+    /// children by `element_props(..).hidden` without going through
+    /// `walk_elem` - list items, table structure (row groups, rows, cells),
+    /// and hidden subtrees inside `<pre>` - has no other reason to compute
+    /// `element_props`, so it goes through this helper instead. Without it,
+    /// an `<a>` whose whole label is such a structural element (e.g.
+    /// `<a href><ul><li hidden>x</li></ul></a>`) would empty the label
+    /// without setting the flag, and the `"a"` arm of
+    /// [`Builder::walk_inline`] would wrongly treat it as a source-empty
+    /// `<a>` and fall back to showing the href as link text.
+    fn hidden(&self, elem: &Element) -> bool {
+        let hidden = self.element_props(elem).hidden;
+        if hidden {
+            self.dropped_hidden.set(true);
+        }
+        hidden
+    }
+
     /// Fold one element's own resolved props into the ancestor-inherited
     /// state: cascade order is inherited delta, then the tag's
     /// presentational default (`<b>`, `<i>`, …), then this element's CSS -
@@ -766,7 +809,9 @@ impl Builder<'_> {
                 // `element_props` gives every other structural site.
                 if let Some(caption) = elem.child_elems().find(|e| e.local == "caption") {
                     let caption_props = self.element_props(caption);
-                    if !caption_props.hidden {
+                    if caption_props.hidden {
+                        self.dropped_hidden.set(true);
+                    } else {
                         let caption_inherited = self.merge_props(caption, inherited, caption_props);
                         let content = self.inline_children(caption, caption_inherited)?;
                         if keeps_paragraph(&content) {
@@ -832,7 +877,7 @@ impl Builder<'_> {
             match node {
                 Node::Text(t) => out.push_str(t),
                 Node::Elem(e) => {
-                    if !self.element_props(e).hidden {
+                    if !self.hidden(e) {
                         self.collect_visible_text(e, out);
                     }
                 }
@@ -931,10 +976,8 @@ impl Builder<'_> {
         inherited: Inherited,
     ) -> Result<Vec<Block>, ConvertError> {
         let ordered = elem.local == "ol";
-        let items: Vec<&Element> = elem
-            .child_elems()
-            .filter(|e| e.local == "li" && !self.element_props(e).hidden)
-            .collect();
+        let items: Vec<&Element> =
+            elem.child_elems().filter(|e| e.local == "li" && !self.hidden(e)).collect();
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -1053,11 +1096,9 @@ impl Builder<'_> {
                     // in it; the group id is still consumed so later groups
                     // keep distinct ids (harmless - `group_end` below only
                     // maps ids that actually appear in `row_elems`).
-                    if !self.element_props(child).hidden {
+                    if !self.hidden(child) {
                         let in_head = child.local == "thead";
-                        for tr in child
-                            .child_elems()
-                            .filter(|e| e.local == "tr" && !self.element_props(e).hidden)
+                        for tr in child.child_elems().filter(|e| e.local == "tr" && !self.hidden(e))
                         {
                             row_elems.push((tr, in_head, group));
                         }
@@ -1066,7 +1107,7 @@ impl Builder<'_> {
                 }
                 "tr" => {
                     in_implicit_group = true;
-                    if !self.element_props(child).hidden {
+                    if !self.hidden(child) {
                         row_elems.push((child, false, group));
                     }
                 }
@@ -1091,7 +1132,7 @@ impl Builder<'_> {
                 if !matches!(cell.local.as_str(), "td" | "th") {
                     continue;
                 }
-                if self.element_props(cell).hidden {
+                if self.hidden(cell) {
                     continue;
                 }
                 any_cell = true;
@@ -1778,6 +1819,46 @@ mod tests {
     }
 
     #[test]
+    fn anchor_wrapping_a_list_with_a_hidden_item_drops_the_link() {
+        // LEAK A follow-up: `<li>` is filtered by `element_props(..).hidden`
+        // directly in `parse_list`, not through `walk_elem`'s early return,
+        // so it must record the drop itself too.
+        let out = blocks(
+            r#"<body><p>
+                <a href="https://evil.example/X"><ul><li hidden="">x</li></ul></a>
+                <a href="https://good.example">kept</a>
+            </p></body>"#,
+        );
+        let Block::Paragraph(inlines) = &out[0] else { panic!("{out:?}") };
+        let links: Vec<&str> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Link { target: LinkTarget::External(u), .. } => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec!["https://good.example"], "{inlines:?}");
+    }
+
+    #[test]
+    fn anchor_wrapping_a_table_with_a_hidden_row_drops_the_link() {
+        // Same leak, via the table row/cell path in `parse_table`.
+        let out = blocks(
+            r#"<body><p><a href="https://evil.example/X"><table><tr hidden=""><td>x</td></tr></table></a></p></body>"#,
+        );
+        assert!(out.is_empty(), "hidden-table-row label must not leak its URL: {out:?}");
+    }
+
+    #[test]
+    fn anchor_wrapping_pre_with_hidden_span_drops_the_link() {
+        // Same leak, via `collect_visible_text`'s own hidden re-check.
+        let out = blocks(
+            r#"<body><p><a href="https://evil.example/X"><pre><span hidden="">x</span></pre></a></p></body>"#,
+        );
+        assert!(out.is_empty(), "hidden-pre-content label must not leak its URL: {out:?}");
+    }
+
+    #[test]
     fn id_selector_hides_the_element() {
         // LEAK B: `#byid` used to be parsed as a tag named `#byid`, which
         // never matches anything, so the rule silently did nothing.
@@ -1819,12 +1900,44 @@ mod tests {
     }
 
     #[test]
+    fn attribute_selectors_parse_into_exactly_the_two_supported_rules() {
+        // `hidden_attribute_selector_hides_the_element` and
+        // `aria_hidden_true_attribute_selector_hides_the_element` above only
+        // exercise elements that the `hidden`/`aria-hidden="true"`
+        // attributes already force-hide outright, regardless of CSS - so
+        // they'd still pass even if `AttrSelector` parsing were deleted
+        // entirely. Pin the parsing itself instead: exactly the two
+        // supported attribute selectors produce a rule, and a lookalike
+        // (`[data-x]`) does not.
+        for selector in ["[hidden]", r#"[aria-hidden="true"]"#, "[aria-hidden=true]"] {
+            let mut sheet = Stylesheet::default();
+            sheet.add(&format!("{selector} {{ display: none }}"));
+            assert_eq!(sheet.rule_count(), 1, "{selector} should parse to one rule");
+        }
+        let mut sheet = Stylesheet::default();
+        sheet.add("[data-x] { display: none }");
+        assert_eq!(sheet.rule_count(), 0, "[data-x] is outside the supported subset");
+    }
+
+    #[test]
     fn descendant_combinator_selector_is_skipped_not_matched() {
         // Documents a known limitation: combinator selectors are out of the
         // supported subset, so the element stays visible rather than being
         // (mis)matched some other way.
         let css = "div.wrap p { display: none }";
         let out = blocks_with_css(r#"<body><div class="wrap"><p>x</p></div></body>"#, css);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(para_text(&out[0]), "x");
+    }
+
+    #[test]
+    fn at_rule_wrapped_selector_is_skipped_not_matched() {
+        // Documents a known limitation: `Stylesheet::add` has no notion of
+        // nesting, so `@media`/`@supports`/`@import` (and any other nested
+        // block) is skipped whole - the wrapped rule's declarations never
+        // take effect, same as an unsupported selector.
+        let css = "@media screen { #x { display: none } }";
+        let out = blocks_with_css(r#"<body><p id="x">x</p></body>"#, css);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(para_text(&out[0]), "x");
     }
