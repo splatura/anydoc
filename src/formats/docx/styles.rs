@@ -24,16 +24,20 @@ pub struct Toggles {
     /// `w:vanish` (ECMA-376 §17.7.3 toggle property). Unlike bold/italic/
     /// strike this never reaches [`Style`] - it is consulted separately so a
     /// hidden style can hide the runs that use it.
-    ///
-    /// Deliberately vanish-only: `w:webHidden` is not an ECMA-376 toggle
-    /// property (it has no defined behavior when repeated down a `basedOn`
-    /// chain), so folding it into this XOR parity the way `strike`/
-    /// `dstrike` are combined would make two `<w:webHidden/>` specifications
-    /// along the chain cancel each other back to visible - an absolute
-    /// property masquerading as a toggle. Direct formatting has no such
-    /// problem (`rpr_delta` treats it as absolute, ORed with vanish), so
-    /// only the style cascade omits it.
     pub hidden: bool,
+    /// `w:webHidden`'s nearest explicit specification along the `basedOn`
+    /// chain (child wins), separately from `hidden`'s XOR parity.
+    ///
+    /// Deliberately not folded into `hidden`'s parity: `w:webHidden` is not
+    /// an ECMA-376 toggle property (it has no defined behavior when
+    /// repeated down a `basedOn` chain), so XORing it the way `strike`/
+    /// `dstrike` are combined would make two `<w:webHidden/>`
+    /// specifications along the chain cancel each other back to visible -
+    /// an absolute property masquerading as a toggle. Instead the nearest
+    /// specification wins, the same absolute-last-wins semantics
+    /// `rpr_delta` already gives direct formatting, and [`Toggles::hidden_over`]
+    /// ORs it into the resolved hidden state.
+    pub web_hidden: Option<bool>,
 }
 
 impl Toggles {
@@ -43,6 +47,9 @@ impl Toggles {
             italic: self.italic ^ other.italic,
             strike: self.strike ^ other.strike,
             hidden: self.hidden ^ other.hidden,
+            // Not a toggle; resolved separately by `run_toggles` (nearest
+            // explicit specification wins) and carried through unchanged.
+            web_hidden: self.web_hidden,
         }
     }
 
@@ -55,10 +62,11 @@ impl Toggles {
         }
     }
 
-    /// The style chain's hidden parity flipped over `base` - the sibling of
+    /// The style chain's hidden parity flipped over `base`, ORed with the
+    /// nearest explicit `web_hidden` specification - the sibling of
     /// [`Toggles::apply_over`] for the property [`Style`] has no room for.
     pub fn hidden_over(self, base: bool) -> bool {
-        base ^ self.hidden
+        (base ^ self.hidden) || self.web_hidden == Some(true)
     }
 }
 
@@ -105,6 +113,9 @@ impl<'a> Styles<'a> {
     /// chain. A `false` in a style leaves the inherited value unchanged.
     pub fn run_toggles(&self, id: &str) -> Result<Toggles, ConvertError> {
         let mut parity = Toggles::default();
+        // The nearest (child-most) explicit `w:webHidden`, absolute rather
+        // than XORed - see `Toggles::web_hidden`.
+        let mut web_hidden = None;
         self.chains.walk::<()>(id, |style| {
             if let Some(rpr) = style.find(ns::W, "rPr") {
                 parity = parity.xor(Toggles {
@@ -113,10 +124,15 @@ impl<'a> Styles<'a> {
                     strike: on_off(rpr, "strike") == Some(true)
                         || on_off(rpr, "dstrike") == Some(true),
                     hidden: on_off(rpr, "vanish") == Some(true),
+                    web_hidden: None,
                 });
+                if web_hidden.is_none() {
+                    web_hidden = on_off(rpr, "webHidden");
+                }
             }
             None
         })?;
+        parity.web_hidden = web_hidden;
         Ok(parity)
     }
 

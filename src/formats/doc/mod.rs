@@ -252,7 +252,7 @@ fn prm0_grpprl(prm: u16) -> Option<Vec<u8>> {
         0x0C => 0x260A, // sprmPIlvl
         0x18 => 0x2416, // sprmPFInTable
         0x19 => 0x2417, // sprmPFTtp
-        0x3F => 0x0800, // sprmCFRMarkDel
+        0x41 => 0x0800, // sprmCFRMarkDel
         0x50 => 0x0811, // sprmCFWebHidden
         0x51 => 0x0818, // sprmCFSpecVanish
         0x55 => 0x0835, // sprmCFBold
@@ -1080,6 +1080,13 @@ mod tests {
     use crate::shared::numbering::NumberText;
     use lists::LevelDef;
 
+    // This module has no inline builder that assembles a full OLE2/FIB/PLC
+    // `WordDocument` stream byte-for-byte, so the hidden/deleted-revision
+    // behaviour added alongside this comment has no end-to-end .doc test
+    // here; it is covered at the `apply_chpx`/`prm0_grpprl` unit level in
+    // `sprm.rs` and above, which exercise the exact toggle-resolution and
+    // Prm0-decoding logic the end-to-end path depends on.
+
     fn list(lsid: u32) -> ListDef {
         let mut levels: [LevelDef; LEVELS] = std::array::from_fn(|_| LevelDef::default());
         levels[0].marker = Some(MarkerKind::Decimal);
@@ -1178,9 +1185,12 @@ mod tests {
         // text the same way a full CHPX grpprl does.
         let prm = (0x5Cu16 << 1) | (0x01 << 8);
         assert_eq!(prm0_grpprl(prm), Some(vec![0x3C, 0x08, 0x01]));
-        // isprm 0x3F = sprmCFRMarkDel (0x0800).
-        let prm = (0x3Fu16 << 1) | (0x01 << 8);
+        // isprm 0x41 = sprmCFRMarkDel (0x0800).
+        let prm = (0x41u16 << 1) | (0x01 << 8);
         assert_eq!(prm0_grpprl(prm), Some(vec![0x00, 0x08, 0x01]));
+        // isprm 0x3F is not defined in the Prm0 table; it must stay a no-op
+        // rather than being mistaken for sprmCFRMarkDel.
+        assert_eq!(prm0_grpprl(0x3F << 1), None);
     }
 
     #[test]

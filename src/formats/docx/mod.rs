@@ -509,6 +509,86 @@ mod tests {
     }
 
     #[test]
+    fn based_on_vanish_cascades_through_a_three_level_chain() {
+        // Regression test for the cascade actually propagating: unlike
+        // `based_on_vanish_cancels_between_parent_and_child_style` (where
+        // vanish/vanish cancel back to visible even without the feature),
+        // this chain has an odd number of `w:vanish` specifications so the
+        // run must resolve hidden - the parity assertion only holds if
+        // hidden keeps cascading through more than one basedOn hop.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Leaf"/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Middle">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            <w:style w:type="character" w:styleId="Leaf">
+                <w:basedOn w:val="Middle"/><w:rPr><w:vanish/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        assert!(doc.blocks.is_empty(), "hidden text must not survive: {:?}", doc.blocks);
+    }
+
+    #[test]
+    fn character_style_web_hidden_hides_its_runs() {
+        // w:webHidden is absolute, not an ECMA-376 toggle, but it must
+        // still cascade through a character style like vanish does.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:rPr><w:rStyle w:val="WebHidden"/></w:rPr><w:t>secret</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="WebHidden"><w:rPr><w:webHidden/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph: {:?}", doc.blocks)
+        };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"), "{text:?}");
+    }
+
+    #[test]
+    fn nearer_web_hidden_specification_wins_over_an_ancestor_style() {
+        // w:webHidden is absolute last-wins along basedOn, not XOR parity:
+        // a child style's explicit off must un-hide even though its parent
+        // specifies webHidden, and direct formatting still overrides both.
+        let document = format!(
+            r#"<w:document {W}><w:body><w:p>
+            <w:r><w:rPr><w:rStyle w:val="Child"/></w:rPr><w:t>visible</w:t></w:r>
+            </w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles {W}>
+            <w:style w:type="character" w:styleId="Hidden"><w:rPr><w:webHidden/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Child">
+                <w:basedOn w:val="Hidden"/><w:rPr><w:webHidden w:val="0"/></w:rPr>
+            </w:style>
+            </w:styles>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document), ("word/styles.xml", &styles)]);
+        let doc = parse(&bytes).unwrap();
+        let Some(Block::Paragraph(inlines)) = doc.blocks.first() else {
+            panic!("expected a paragraph, nearer webHidden=0 must win: {:?}", doc.blocks)
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines).trim(), "visible");
+    }
+
+    #[test]
     fn hidden_fld_char_separate_does_not_drop_the_visible_field_result() {
         // A field's structural markers (w:fldChar/w:instrText) must still
         // be walked even when the marker's own run is hidden: a hidden
