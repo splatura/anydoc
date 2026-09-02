@@ -275,7 +275,7 @@ Because every format funnels through the same document model and serializer, out
 
 ## What is left out
 
-- **Author-hidden content is omitted.** Word hidden ("vanish") text and hidden revision-deleted text in `.doc`/`.docx`/`.rtf`, hidden slides and hidden shapes in presentations, EPUB text styled `display:none` / `visibility:hidden` / `opacity:0` / `font-size:0` or carrying the `hidden` or `aria-hidden` attributes, ODF `text:display` none and collapsed table rows, hidden rows/columns/sheets in spreadsheets, and tracked deletions and comments are all dropped. White-on-white text and off-page positioning are not detected.
+- **Author-hidden content is omitted.** Word hidden ("vanish") text and hidden revision-deleted text in `.doc`/`.docx`/`.rtf`, hidden slides and hidden shapes in presentations, EPUB text styled `display:none` / `visibility:hidden` / `opacity:0` / `font-size:0` or carrying the `hidden` attribute or `aria-hidden="true"`, ODF `text:display` none and collapsed table rows, hidden rows, columns and sheets in Excel files and hidden rows in ODS, and tracked deletions and comments are all dropped. White-on-white text and off-page positioning are not detected.
 - **Speaker notes are kept**, quoted under a "Speaker notes" label.
 - **Link destinations are kept only for `http`, `https`, `mailto`, `tel`, `ftp`, and `ftps`.** Other schemes (`javascript:`, `data:`, `file:`, UNC paths) render as their label text.
 - **Images never carry a URL in the Markdown.** Embedded and linked images render as their alt text. The bytes of embedded images are available through `to_document`.
@@ -294,11 +294,13 @@ wasm-pack build wasm --release --target web --scope firecrawl && node --test was
 
 A committed fixture corpus under `tests/fixtures/` is snapshot-tested, `tests/robustness.rs` mutation-tests every fixture, and `fuzz/` carries cargo-fuzz targets per format. The speed and quality benchmark lives in [`bench/`](bench/README.md).
 
-Releases are tagged `v<version>`, which publishes the crate, the npm package, and the PyPI wheels from [`.github/workflows/release.yml`](.github/workflows/release.yml). The version lives in four places, bumped together for a release:
+Releases are tagged `v<version>`, which publishes the crate, the npm package, and the PyPI wheels from [`.github/workflows/release.yml`](.github/workflows/release.yml). The version lives in six places, bumped together for a release and checked by [`scripts/check-versions.sh`](scripts/check-versions.sh):
 
 - [`Cargo.toml`](Cargo.toml): the crate
 - [`node/package.json`](node/package.json): the npm package
+- [`node/index.js`](node/index.js): the generated loader's version guard (regenerate with `npm run build` in `node/`)
 - [`python/Cargo.toml`](python/Cargo.toml): the wheel (`python/pyproject.toml` reads it)
+- [`wasm/Cargo.toml`](wasm/Cargo.toml): the wasm package
 - [`skills/convert-documents-to-markdown/SKILL.md`](skills/convert-documents-to-markdown/SKILL.md): the `@firecrawl/anydoc@<version>` pin in every `npx` example
 
 ## License
