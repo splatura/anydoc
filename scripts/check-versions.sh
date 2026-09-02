@@ -55,7 +55,7 @@ skill_version=$(printf '%s\n' "$skill_versions" | tr '\n' ',' | sed 's/,$//')
 
 # Any `npx` example that mentions @firecrawl/anydoc without a version pin
 # (e.g. the pin was accidentally dropped) is a supply-chain regression.
-if grep -E 'npx[^\n]*@firecrawl/anydoc([^@]|$)' "$skill_file" >/dev/null; then
+if grep -E 'npx.*@firecrawl/anydoc([^@]|$)' "$skill_file" >/dev/null; then
   report "error: unpinned npx @firecrawl/anydoc example in $skill_file"
   err=1
 fi

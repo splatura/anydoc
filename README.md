@@ -275,7 +275,7 @@ Because every format funnels through the same document model and serializer, out
 
 ## What is left out
 
-- **Author-hidden content is omitted.** Word hidden ("vanish") text and hidden revision-deleted text in `.doc`/`.docx`/`.rtf`, hidden slides and hidden shapes in presentations, EPUB text styled `display:none` / `visibility:hidden` / `opacity:0` / `font-size:0` or carrying the `hidden` or `aria-hidden` attributes, ODF `text:display` none and collapsed table rows, hidden rows/columns/sheets in spreadsheets (already the case), and tracked deletions and comments (already the case) are all dropped. White-on-white text and off-page positioning are not detected.
+- **Author-hidden content is omitted.** Word hidden ("vanish") text and hidden revision-deleted text in `.doc`/`.docx`/`.rtf`, hidden slides and hidden shapes in presentations, EPUB text styled `display:none` / `visibility:hidden` / `opacity:0` / `font-size:0` or carrying the `hidden` or `aria-hidden` attributes, ODF `text:display` none and collapsed table rows, hidden rows/columns/sheets in spreadsheets, and tracked deletions and comments are all dropped. White-on-white text and off-page positioning are not detected.
 - **Speaker notes are kept**, quoted under a "Speaker notes" label.
 - **Link destinations are kept only for `http`, `https`, `mailto`, `tel`, `ftp`, and `ftps`.** Other schemes (`javascript:`, `data:`, `file:`, UNC paths) render as their label text.
 - **Images never carry a URL in the Markdown.** Embedded and linked images render as their alt text. The bytes of embedded images are available through `to_document`.
