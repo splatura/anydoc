@@ -7,6 +7,16 @@
 //! later cell keeps its source coordinates; only trailing filler (empty rows
 //! at the end, empty cells at a row's end) is elided. All materialization is
 //! charged against the fixed expansion budget.
+//!
+//! A row with `table:visibility="collapse"` (grouped/outlined) or `"filter"`
+//! (AutoFilter) is author-hidden and dropped outright - repeats included,
+//! and before it is charged against the expansion budget. A whole
+//! `table:table-row-group` with `table:display="false"` (ODF 1.2 §19.615)
+//! is dropped the same way. `table:column` carries the row's `visibility`
+//! attribute too, but this module has no column-to-cell index to hide the
+//! corresponding cells through, so hidden columns are not currently handled
+//! (their cells still render); see the parse module's notes for what that
+//! would take.
 
 use crate::error::ConvertError;
 use crate::formats::odf::text::{Ctx, parse_container};
@@ -196,8 +206,20 @@ fn walk_rows(
                     state.header_rows = state.rows_emitted - before;
                 }
             }
+            "table-row-group" if child.attr(ns::TABLE, "display") == Some("false") => {
+                // A whole hidden row group (ODF 1.2 SS19.615
+                // `table:display="false"` on `table:table-row-group`):
+                // dropped the same way as an individually hidden row.
+            }
             "table-rows" | "table-row-group" => walk_rows(child, ctx, state, false)?,
             "table-row" => {
+                // Author-hidden row (`table:visibility="collapse"` from a
+                // grouped/outlined row, or `"filter"` from AutoFilter):
+                // dropped entirely, repeats included, before anything about
+                // it is charged against the expansion budget.
+                if matches!(child.attr(ns::TABLE, "visibility"), Some("collapse" | "filter")) {
+                    continue;
+                }
                 let repeat: u64 = child
                     .attr(ns::TABLE, "number-rows-repeated")
                     .and_then(|v| v.parse().ok())

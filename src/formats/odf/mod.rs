@@ -1,4 +1,18 @@
 //! OpenDocument Text (.odt), Spreadsheet (.ods), and Presentation (.odp).
+//!
+//! Author-hidden content is dropped (see `text.rs` for `text:display`,
+//! `table.rs` for row `table:visibility`). Two more ODF hiding mechanisms
+//! are known but not handled, for the same reason: this module resolves
+//! paragraph/text/list styles only, and both would need a first accessor
+//! into `OdfStyles`'s raw style map for a different style family plus a
+//! lookup at the corresponding call site here.
+//! - A `draw:page` (ODP) hides via `presentation:visibility="hidden"` on the
+//!   `style:drawing-page-properties` of the style its `draw:style-name`
+//!   names - a lookup [`parse_presentation`] would need per page.
+//! - A sheet (ODS) hides via `table:display="false"` on the
+//!   `style:table-properties` of the style its `table:style-name` names on
+//!   `table:table` - a lookup `table::parse_spreadsheet` would need per
+//!   sheet.
 
 mod styles;
 mod table;
@@ -246,6 +260,186 @@ mod tests {
             </table:table-row>"#;
         let doc = parse(&odt_with_content(&table_doc(rows))).unwrap();
         assert_eq!(doc.notes.len(), 1, "repeated rows must not duplicate notes");
+    }
+
+    #[test]
+    fn text_display_none_drops_a_spans_content() {
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:automatic-styles>
+              <style:style style:name="T1" style:family="text">
+                <style:text-properties text:display="none"/>
+              </style:style>
+            </office:automatic-styles>
+            <office:body><office:text>
+              <text:p>before <text:span text:style-name="T1">secret</text:span> after</text:p>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let doc = parse(&odt_with_content(content)).unwrap();
+        let [Block::Paragraph(inlines)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        let text = crate::model::inlines_to_plain_text(inlines);
+        assert!(!text.contains("secret"), "{text:?}");
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn text_display_none_on_a_paragraph_style_drops_the_whole_paragraph() {
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:automatic-styles>
+              <style:style style:name="Hidden" style:family="paragraph">
+                <style:text-properties text:display="none"/>
+              </style:style>
+            </office:automatic-styles>
+            <office:body><office:text>
+              <text:p>visible one</text:p>
+              <text:p text:style-name="Hidden">gone</text:p>
+              <text:p>visible two</text:p>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let doc = parse(&odt_with_content(content)).unwrap();
+        assert_eq!(doc.blocks.len(), 2, "{:?}", doc.blocks);
+        let [Block::Paragraph(a), Block::Paragraph(b)] = &doc.blocks[..] else {
+            panic!("unexpected blocks: {:?}", doc.blocks);
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(a), "visible one");
+        assert_eq!(crate::model::inlines_to_plain_text(b), "visible two");
+    }
+
+    #[test]
+    fn text_display_condition_is_treated_as_visible() {
+        // `text:display="condition"` depends on a live `text:condition`
+        // this converter does not evaluate, so it resolves visible - only
+        // the literal `"none"` hides.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:automatic-styles>
+              <style:style style:name="T1" style:family="text">
+                <style:text-properties text:display="condition" text:condition="x"/>
+              </style:style>
+            </office:automatic-styles>
+            <office:body><office:text>
+              <text:p><text:span text:style-name="T1">shown</text:span></text:p>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let doc = parse(&odt_with_content(content)).unwrap();
+        let [Block::Paragraph(inlines)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(crate::model::inlines_to_plain_text(inlines), "shown");
+    }
+
+    #[test]
+    fn text_display_none_on_a_section_drops_it_entirely() {
+        // Writer's Insert Section > Hide writes `text:display="none"`
+        // directly on the `text:section`, not through a style.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:body><office:text>
+              <text:p>before</text:p>
+              <text:section text:name="S" text:display="none">
+                <text:p>secret one</text:p>
+                <text:p>secret two</text:p>
+              </text:section>
+              <text:p>after</text:p>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let doc = parse(&odt_with_content(content)).unwrap();
+        assert_eq!(doc.blocks.len(), 2, "{:?}", doc.blocks);
+        let [Block::Paragraph(a), Block::Paragraph(b)] = &doc.blocks[..] else {
+            panic!("unexpected blocks: {:?}", doc.blocks);
+        };
+        assert_eq!(crate::model::inlines_to_plain_text(a), "before");
+        assert_eq!(crate::model::inlines_to_plain_text(b), "after");
+    }
+
+    #[test]
+    fn list_item_emptied_by_hidden_content_is_dropped() {
+        // A list item whose only paragraph is author-hidden must not leave
+        // a bare marker with no content behind.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:automatic-styles>
+              <style:style style:name="Hidden" style:family="paragraph">
+                <style:text-properties text:display="none"/>
+              </style:style>
+            </office:automatic-styles>
+            <office:body><office:text>
+              <text:list>
+                <text:list-item><text:p>one</text:p></text:list-item>
+                <text:list-item><text:p text:style-name="Hidden">gone</text:p></text:list-item>
+                <text:list-item><text:p>three</text:p></text:list-item>
+              </text:list>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let doc = parse(&odt_with_content(content)).unwrap();
+        let [Block::List(list)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(list.items.len(), 2, "{list:?}");
+        let item_text = |i: usize| {
+            let [Block::Paragraph(p)] = &list.items[i].blocks[..] else {
+                panic!("{:?}", list.items[i])
+            };
+            crate::model::inlines_to_plain_text(p)
+        };
+        assert_eq!(item_text(0), "one");
+        assert_eq!(item_text(1), "three");
+    }
+
+    #[test]
+    fn table_visibility_collapse_drops_the_row() {
+        let rows = r#"
+            <table:table-row><table:table-cell><text:p>keep</text:p></table:table-cell></table:table-row>
+            <table:table-row table:visibility="collapse">
+                <table:table-cell><text:p>hidden</text:p></table:table-cell>
+            </table:table-row>
+            <table:table-row table:visibility="filter">
+                <table:table-cell><text:p>also hidden</text:p></table:table-cell>
+            </table:table-row>
+        "#;
+        let doc = parse(&odt_with_content(&table_doc(rows))).unwrap();
+        let [Block::Table(table)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(table.grid.len(), 1, "collapsed/filtered rows must not appear: {table:?}");
+    }
+
+    #[test]
+    fn hidden_table_row_group_is_dropped() {
+        // ODF 1.2 SS19.615: `table:display="false"` on a whole
+        // `table:table-row-group` hides every row in it, same as a row's
+        // own `table:visibility`.
+        let rows = r#"
+            <table:table-row><table:table-cell><text:p>keep</text:p></table:table-cell></table:table-row>
+            <table:table-row-group table:display="false">
+                <table:table-row><table:table-cell><text:p>hidden1</text:p></table:table-cell></table:table-row>
+                <table:table-row><table:table-cell><text:p>hidden2</text:p></table:table-cell></table:table-row>
+            </table:table-row-group>
+        "#;
+        let doc = parse(&odt_with_content(&table_doc(rows))).unwrap();
+        let [Block::Table(table)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(table.grid.len(), 1, "the hidden group's rows must not appear: {table:?}");
+    }
+
+    #[test]
+    fn repeated_collapsed_rows_are_dropped_without_charging_the_expansion_budget() {
+        // A hidden row's repeats must not even be charged against the
+        // expansion budget - they never enter the grid at all.
+        let fat = "x".repeat(100_000);
+        let rows = format!(
+            r#"<table:table-row table:visibility="collapse" table:number-rows-repeated="1000">
+            <table:table-cell><text:p>{fat}</text:p></table:table-cell>
+            </table:table-row>
+            <table:table-row><table:table-cell><text:p>kept</text:p></table:table-cell></table:table-row>"#
+        );
+        let doc = parse(&odt_with_content(&table_doc(&rows))).unwrap();
+        let [Block::Table(table)] = &doc.blocks[..] else { panic!("{:?}", doc.blocks) };
+        assert_eq!(table.grid.len(), 1, "only the kept row should remain: {table:?}");
     }
 
     #[test]

@@ -1,4 +1,17 @@
 //! Block and inline walking for ODF text content.
+//!
+//! Author-hidden text (`text:display="none"` on a style's
+//! `style:text-properties`, resolved through the style chain the same way
+//! as bold/italic/strike) is dropped, with no option to keep it: a hidden
+//! paragraph contributes nothing at all, and a hidden `text:span` drops
+//! only its own subtree. A `<text:section>` with `text:display="none"`
+//! (Writer's "Insert Section > Hide") is checked directly on the element
+//! itself - a section carries the attribute, not a style - and drops the
+//! whole section. `text:display="condition"` is treated as visible in both
+//! cases (the field's live condition is not evaluated). A list item left
+//! with no blocks after its content was dropped this way is itself dropped
+//! rather than kept as an empty marker (see [`parse_list`]); a source list
+//! item that was always empty is unaffected.
 
 use crate::error::ConvertError;
 use crate::formats::odf::styles::{LIST_LEVELS, OdfStyles, parse_start};
@@ -77,10 +90,11 @@ fn parse_block_elem(
                     .attr(ns::TEXT, "outline-level")
                     .and_then(|v| v.parse::<u8>().ok())
                     .unwrap_or(1);
-                let (inlines, boxes) = parse_inline_content(elem, ctx)?;
+                let base = paragraph_base(elem, ctx)?;
+                let (inlines, boxes) = parse_inline_content(elem, ctx, base)?;
                 if !inlines_are_empty(&inlines) {
                     let mut content = inlines;
-                    rebase_emphasis(&mut content, paragraph_base(elem, ctx)?.resolve());
+                    rebase_emphasis(&mut content, base.resolve());
                     // ODF outline links target headings by their text; carry
                     // it as the heading's anchor id (without the number).
                     let anchor = Some(crate::model::inlines_to_plain_text(&content));
@@ -93,7 +107,18 @@ fn parse_block_elem(
                 return Ok(());
             }
             "p" => {
-                let (inlines, boxes) = parse_inline_content(elem, ctx)?;
+                // Author-hidden (`text:display="none"`, resolved through
+                // the paragraph style chain same as bold): the paragraph
+                // contributes nothing, not even as an empty placeholder,
+                // and the surrounding run of same-styled paragraphs treats
+                // it as if it were never there. `base` is resolved once and
+                // passed to `parse_inline_content` rather than re-resolved
+                // there.
+                let base = paragraph_base(elem, ctx)?;
+                if base.hidden == Some(true) {
+                    return Ok(());
+                }
+                let (inlines, boxes) = parse_inline_content(elem, ctx, base)?;
                 let style =
                     elem.attr(ns::TEXT, "style-name").and_then(|n| ctx.styles.block_style(n));
                 match style {
@@ -114,7 +139,20 @@ fn parse_block_elem(
                 blocks.extend(parse_list(elem, ctx, 0, None, &[])?);
                 return Ok(());
             }
-            "section" | "index-body" | "index-title" => {
+            "section" => {
+                // A section's own `text:display="none"` (Writer's "Insert
+                // Section > Hide") is a direct attribute, not a style
+                // property - checked the same way as `text-properties`:
+                // "condition" (a live `text:condition` this converter does
+                // not evaluate) resolves visible, same as any value other
+                // than the literal "none".
+                if elem.attr(ns::TEXT, "display") == Some("none") {
+                    return Ok(());
+                }
+                blocks.extend(parse_container(elem, ctx)?);
+                return Ok(());
+            }
+            "index-body" | "index-title" => {
                 blocks.extend(parse_container(elem, ctx)?);
                 return Ok(());
             }
@@ -217,7 +255,14 @@ fn parse_list(
         }
         first_item = false;
         let label = item_label(ctx, style_name, depth, &chain);
-        current.items.push(ListItem { blocks: item_blocks, marker_label: label });
+        // A list item left with no blocks because its only content was
+        // author-hidden (e.g. a single `text:display="none"` paragraph) is
+        // dropped rather than kept as a bare marker; an item that was
+        // always empty in the source is unaffected (`list_item_had_content`
+        // is false for it).
+        if !(item_blocks.is_empty() && list_item_had_content(item)) {
+            current.items.push(ListItem { blocks: item_blocks, marker_label: label });
+        }
         next = current.start.saturating_add(current.items.len() as u64);
     }
     flush(&mut current, &mut out, next);
@@ -228,6 +273,14 @@ fn parse_list(
         }
     }
     Ok(out)
+}
+
+/// Whether a `text:list-item`/`text:list-header` had any child element in
+/// the source - distinguishes "ended up empty because its only content was
+/// author-hidden" from an item that was always empty, so [`parse_list`]
+/// drops only the former as a bare marker.
+fn list_item_had_content(item: &Element) -> bool {
+    item.child_elems().next().is_some()
 }
 
 /// A list item's composite marker label (`num-prefix`/`num-suffix`/
@@ -291,12 +344,19 @@ fn heading_label(elem: &Element, level: u8, ctx: &Ctx) -> Option<String> {
 }
 
 /// Inline content of a paragraph plus block attachments (text boxes) that
-/// were anchored in it.
+/// were anchored in it. `base` is the paragraph's already-resolved style
+/// chain - callers that need it anyway (the `hidden` check on the "h"/"p"
+/// arms above) pass it in rather than have it resolved a second time here;
+/// the `hidden` check is kept regardless as a guard for any future caller
+/// that does not.
 fn parse_inline_content(
     elem: &Element,
     ctx: &Ctx,
+    base: StyleDelta,
 ) -> Result<(Vec<Inline>, Vec<Block>), ConvertError> {
-    let base = paragraph_base(elem, ctx)?;
+    if base.hidden == Some(true) {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut out = Vec::new();
     let mut boxes = Vec::new();
     walk_inlines(elem, ctx, base, &mut out, &mut boxes)?;
@@ -334,7 +394,12 @@ fn walk_inlines(
                                 Some(name) => delta.merge(ctx.styles.delta("text", name)?),
                                 None => delta,
                             };
-                            walk_inlines(child, ctx, merged, out, boxes)?;
+                            // Author-hidden span (`text:display="none"` on
+                            // its character style, resolved through the
+                            // same chain as bold): drop its content.
+                            if merged.hidden != Some(true) {
+                                walk_inlines(child, ctx, merged, out, boxes)?;
+                            }
                             continue;
                         }
                         "a" => {

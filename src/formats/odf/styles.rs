@@ -4,6 +4,11 @@
 //!
 //! Chains are keyed by owned `family\0name` strings because definitions come
 //! from two separately parsed trees (`styles.xml` and `content.xml`).
+//!
+//! `text:display` on `style:text-properties` carries through the chain as
+//! [`StyleDelta::hidden`] the same way as bold/italic/strike: `"none"`
+//! resolves hidden, `"condition"` and everything else (including the
+//! default `"true"`) resolves visible - see [`text_properties_delta`].
 
 use crate::error::ConvertError;
 use crate::package::xml::{Element, ns};
@@ -234,6 +239,11 @@ pub fn text_properties_delta(elem: &Element) -> StyleDelta {
         italic: props.attr(ns::FO, "font-style").map(|s| s == "italic" || s == "oblique"),
         strike: props.attr(ns::STYLE, "text-line-through-style").map(|lt| lt != "none"),
         code: None,
-        hidden: None,
+        // `text:display` is `"true"` (visible, the default), `"none"`
+        // (author-hidden), or `"condition"` (visible unless a
+        // `text:condition` evaluates false at display time - we don't
+        // evaluate field conditions, so "condition" resolves visible here,
+        // same as any value other than the literal `"none"`).
+        hidden: props.attr(ns::TEXT, "display").map(|v| v == "none"),
     }
 }
