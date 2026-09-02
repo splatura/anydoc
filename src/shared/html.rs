@@ -11,14 +11,29 @@
 //! none`, `visibility: hidden`/`collapse`, `opacity: 0` (numeric zero in any
 //! form, `0%` included though not valid CSS), `font-size: 0` (any unit), the
 //! `hidden` attribute (a boolean attribute - any value hides, including
-//! `hidden="until-found"`), and `aria-hidden="true"`. A hidden ancestor
-//! hides every descendant regardless of the descendant's own declarations -
-//! [`Builder::walk_elem`] returns before recursing once an element's own
-//! props resolve hidden, so a child's `display: block` never gets a chance
-//! to run. White-on-white text and off-page positioning are out of scope:
-//! not reliably detectable from markup alone. A closed (non-`open`)
-//! `<details>` is left as-is - its body is a UI click away, not
-//! author-hidden content, so it still renders.
+//! `hidden="until-found"`), and `aria-hidden="true"` (case-insensitive). The
+//! four CSS triggers are tracked as independent tri-states in [`StyleProps`]
+//! and merged independently through the cascade, so a declaration only
+//! cancels its own property's hide: `font-size: 0; display: inline` and
+//! `opacity: 0; display: block` both still hide (a later/higher-priority
+//! `display` cannot undo a `font-size`/`opacity`/`visibility` hide, and vice
+//! versa) - only `display: <not none>` cancels a prior `display: none`,
+//! only `visibility: visible` cancels a prior `visibility: hidden`, and only
+//! a non-zero `opacity`/`font-size` cancels a prior zero one. A hidden
+//! ancestor hides every descendant regardless of the descendant's own
+//! declarations - [`Builder::walk_elem`] returns before recursing once an
+//! element's own props resolve hidden, so a child's `display: block` never
+//! gets a chance to run (this includes `<body>` itself, checked by
+//! [`to_blocks`], and structural elements - `<li>`, `<tr>`,
+//! `<thead>`/`<tbody>`/`<tfoot>`, `<td>`/`<th>` - which are collected
+//! directly by [`Builder::parse_list`] and [`Builder::parse_table`] rather
+//! than through `walk_elem`, so those call sites re-check `element_props`
+//! themselves). A list item left with no blocks because its only content
+//! was hidden is dropped rather than kept as an empty marker; a genuinely
+//! empty `<li></li>` in the source is unaffected. White-on-white text and
+//! off-page positioning are out of scope: not reliably detectable from
+//! markup alone. A closed (non-`open`) `<details>` is left as-is - its body
+//! is a UI click away, not author-hidden content, so it still renders.
 
 use crate::error::ConvertError;
 use crate::model::{
@@ -48,7 +63,16 @@ pub fn to_blocks(
 ) -> Result<Vec<Block>, ConvertError> {
     let mut builder =
         Builder { blocks: Vec::new(), inlines: Vec::new(), css, ctx, start_boundary: true };
-    builder.walk_children(body, StyleDelta::default())?;
+    // `<body>` itself never goes through `walk_elem`, so its own hiding
+    // declarations (or an ancestor `<html>` rule reaching it) would
+    // otherwise be silently ignored; its own delta is threaded in as the
+    // initial one for the same reason `walk_elem` does for every other
+    // element.
+    let body_props = builder.element_props(body);
+    if body_props.hidden {
+        return Ok(Vec::new());
+    }
+    builder.walk_children(body, StyleDelta::default().merge(body_props.delta))?;
     Ok(builder.finish())
 }
 
@@ -58,22 +82,43 @@ pub fn to_blocks(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StyleProps {
     pub delta: StyleDelta,
-    /// Author-hidden visibility as a tri-state, combining `display`,
-    /// `visibility`, `opacity`, and `font-size` (see the module docs for the
-    /// exact triggers): a higher-priority declaration that resolves visible
-    /// can restore content a lower-priority one hid, on the same element.
-    /// It cannot reach across elements - a hidden ancestor's descendants
-    /// are skipped outright, never re-evaluated.
-    pub hidden: Option<bool>,
+    /// The four CSS hiding triggers, each an independent tri-state: `Some`
+    /// once a declaration for that specific property has been seen on this
+    /// element, cleared only by another declaration of the *same* property
+    /// (see the module docs). Kept separate - rather than folded into one
+    /// `hidden` flag - so `font-size: 0; display: inline` cannot un-hide
+    /// itself: each field merges independently in [`StyleProps::merge`].
+    display_none: Option<bool>,
+    visibility_hidden: Option<bool>,
+    opacity_zero: Option<bool>,
+    font_size_zero: Option<bool>,
+    /// The element's final hidden decision: any trigger above resolving
+    /// true, or the `hidden` attribute / `aria-hidden="true"`. Computed once
+    /// by [`Builder::element_props`] after the cascade is fully merged; the
+    /// per-property fields above are what participate in the cascade
+    /// itself, so this is always `false` on a [`StyleProps`] fresh out of
+    /// [`parse_declarations`] or a stylesheet rule.
+    pub hidden: bool,
 }
 
 impl StyleProps {
     fn merge(self, over: StyleProps) -> StyleProps {
-        StyleProps { delta: self.delta.merge(over.delta), hidden: over.hidden.or(self.hidden) }
+        StyleProps {
+            delta: self.delta.merge(over.delta),
+            display_none: over.display_none.or(self.display_none),
+            visibility_hidden: over.visibility_hidden.or(self.visibility_hidden),
+            opacity_zero: over.opacity_zero.or(self.opacity_zero),
+            font_size_zero: over.font_size_zero.or(self.font_size_zero),
+            hidden: false,
+        }
     }
 
     fn is_default(&self) -> bool {
-        self.delta == StyleDelta::default() && self.hidden.is_none()
+        self.delta == StyleDelta::default()
+            && self.display_none.is_none()
+            && self.visibility_hidden.is_none()
+            && self.opacity_zero.is_none()
+            && self.font_size_zero.is_none()
     }
 }
 
@@ -213,23 +258,23 @@ fn parse_declarations(body: &str) -> DeclProps {
                 }
             }
             "display" => {
-                props.hidden = Some(value == "none");
+                props.display_none = Some(value == "none");
             }
             "visibility" => {
                 if value == "hidden" || value == "collapse" {
-                    props.hidden = Some(true);
+                    props.visibility_hidden = Some(true);
                 } else if value == "visible" {
-                    props.hidden = Some(false);
+                    props.visibility_hidden = Some(false);
                 }
             }
             "opacity" => {
-                if is_zero_value(&value) {
-                    props.hidden = Some(true);
+                if let Some(zero) = numeric_is_zero(&value) {
+                    props.opacity_zero = Some(zero);
                 }
             }
             "font-size" => {
-                if is_zero_value(&value) {
-                    props.hidden = Some(true);
+                if let Some(zero) = numeric_is_zero(&value) {
+                    props.font_size_zero = Some(zero);
                 }
             }
             _ => {}
@@ -239,13 +284,18 @@ fn parse_declarations(body: &str) -> DeclProps {
 }
 
 /// Whether a CSS numeric value - with or without a trailing unit (`px`,
-/// `em`, `pt`, `%`) - is zero. Used for `opacity` and `font-size`, where
-/// `0`, `0.0`, `0px`, and `0%` all read as "invisible" even though not
-/// every combination is valid CSS (`opacity` takes no unit, but documents
-/// spell it like a length anyway often enough to be worth tolerating).
-fn is_zero_value(value: &str) -> bool {
+/// `em`, `pt`, `%`) - is zero, or `None` when it isn't a plain number at all
+/// (a keyword like `inherit`, which leaves the corresponding hiding trigger
+/// untouched rather than asserting non-zero). Used for `opacity` and
+/// `font-size`, where `0`, `0.0`, `0px`, and `0%` all read as "invisible"
+/// even though not every combination is valid CSS (`opacity` takes no unit,
+/// but documents spell it like a length anyway often enough to be worth
+/// tolerating). A non-zero result is `Some(false)` rather than `None` so
+/// that, on the same element, it can cancel a lower-priority declaration of
+/// the *same* property that hid via zero (see [`StyleProps`]).
+fn numeric_is_zero(value: &str) -> Option<bool> {
     let numeric = value.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
-    numeric.parse::<f64>().is_ok_and(|n| n == 0.0)
+    numeric.parse::<f64>().ok().map(|n| n == 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,16 +408,26 @@ impl Builder<'_> {
         for (_, entry) in entries {
             props = props.merge(entry);
         }
+        // Fold the four independent triggers into one decision: any of them
+        // resolving true hides, and only that same property's own opposite
+        // value (handled above, per declaration) can cancel it - a
+        // `display: block` cannot cancel a `font-size: 0` hide, etc.
+        props.hidden = props.display_none == Some(true)
+            || props.visibility_hidden == Some(true)
+            || props.opacity_zero == Some(true)
+            || props.font_size_zero == Some(true);
         // The `hidden` attribute (a boolean attribute: any value, including
-        // `hidden="until-found"`, hides) and `aria-hidden="true"` are HTML
-        // semantics, not CSS - they sit outside the cascade above and force
-        // hidden regardless of any `display`/`visibility`/etc. declaration,
-        // unlike a browser's low-specificity UA rule for `[hidden]` which an
-        // author style can override.
+        // `hidden="until-found"`, hides) and `aria-hidden="true"`
+        // (case-insensitively; HTML enumerated attribute values are ASCII
+        // case-insensitive) are HTML semantics, not CSS - they sit outside
+        // the cascade above and force hidden regardless of any
+        // `display`/`visibility`/etc. declaration, unlike a browser's
+        // low-specificity UA rule for `[hidden]` which an author style can
+        // override.
         if elem.attr_any("hidden").is_some()
-            || elem.attr_any("aria-hidden").is_some_and(|v| v == "true")
+            || elem.attr_any("aria-hidden").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
         {
-            props.hidden = Some(true);
+            props.hidden = true;
         }
         props
     }
@@ -414,7 +474,7 @@ impl Builder<'_> {
 
     fn walk_elem(&mut self, elem: &Element, delta: StyleDelta) -> Result<(), ConvertError> {
         let props = self.element_props(elem);
-        if props.hidden == Some(true) {
+        if props.hidden {
             return Ok(());
         }
         // Cascade order: inherited delta, then the tag's presentational
@@ -594,15 +654,28 @@ impl Builder<'_> {
         delta: StyleDelta,
     ) -> Result<Vec<Block>, ConvertError> {
         let ordered = elem.local == "ol";
-        let items: Vec<&Element> = elem.child_elems().filter(|e| e.local == "li").collect();
+        let items: Vec<&Element> = elem
+            .child_elems()
+            .filter(|e| e.local == "li" && !self.element_props(e).hidden)
+            .collect();
         if items.is_empty() {
             return Ok(Vec::new());
         }
         if !ordered {
             let mut list_items = Vec::with_capacity(items.len());
             for li in &items {
-                list_items
-                    .push(ListItem { blocks: self.sub_blocks(li, delta)?, marker_label: None });
+                let blocks = self.sub_blocks(li, delta)?;
+                // A visible `<li>` whose only content was itself dropped as
+                // hidden leaves no blocks; keep it out rather than render a
+                // bare marker for content that no longer exists. A source
+                // `<li></li>` that was always empty is unaffected.
+                if blocks.is_empty() && li_had_content(li) {
+                    continue;
+                }
+                list_items.push(ListItem { blocks, marker_label: None });
+            }
+            if list_items.is_empty() {
+                return Ok(Vec::new());
             }
             let list = List { marker: MarkerKind::Bullet, start: 1, items: list_items };
             return Ok(vec![Block::List(list)]);
@@ -636,10 +709,14 @@ impl Builder<'_> {
         if numbers.iter().any(|&n| n < 1) {
             let mut list_items = Vec::with_capacity(items.len());
             for (li, &n) in items.iter().zip(&numbers) {
-                list_items.push(ListItem {
-                    blocks: self.sub_blocks(li, delta)?,
-                    marker_label: Some(format!("{n}.")),
-                });
+                let blocks = self.sub_blocks(li, delta)?;
+                if blocks.is_empty() && li_had_content(li) {
+                    continue;
+                }
+                list_items.push(ListItem { blocks, marker_label: Some(format!("{n}.")) });
+            }
+            if list_items.is_empty() {
+                return Ok(Vec::new());
             }
             return Ok(vec![Block::List(List { marker, start: 1, items: list_items })]);
         }
@@ -647,18 +724,25 @@ impl Builder<'_> {
         let mut current: Option<List> = None;
         let mut last_number = 0i64;
         for (li, &number) in items.iter().zip(&numbers) {
-            let item = ListItem { blocks: self.sub_blocks(li, delta)?, marker_label: None };
+            let blocks = self.sub_blocks(li, delta)?;
+            let skip = blocks.is_empty() && li_had_content(li);
             let contiguous = current.is_some() && last_number.checked_add(1) == Some(number);
             if !contiguous {
-                if let Some(list) = current.take() {
+                if let Some(list) = current.take()
+                    && !list.items.is_empty()
+                {
                     out.push(Block::List(list));
                 }
                 current = Some(List { marker, start: number as u64, items: Vec::new() });
             }
-            current.as_mut().unwrap().items.push(item);
+            if !skip {
+                current.as_mut().unwrap().items.push(ListItem { blocks, marker_label: None });
+            }
             last_number = number;
         }
-        if let Some(list) = current {
+        if let Some(list) = current
+            && !list.items.is_empty()
+        {
             out.push(Block::List(list));
         }
         Ok(out)
@@ -682,15 +766,26 @@ impl Builder<'_> {
                         in_implicit_group = false;
                         group += 1;
                     }
-                    let in_head = child.local == "thead";
-                    for tr in child.child_elems().filter(|e| e.local == "tr") {
-                        row_elems.push((tr, in_head, group));
+                    // A hidden group (e.g. `<tbody hidden>`) drops every row
+                    // in it; the group id is still consumed so later groups
+                    // keep distinct ids (harmless - `group_end` below only
+                    // maps ids that actually appear in `row_elems`).
+                    if !self.element_props(child).hidden {
+                        let in_head = child.local == "thead";
+                        for tr in child
+                            .child_elems()
+                            .filter(|e| e.local == "tr" && !self.element_props(e).hidden)
+                        {
+                            row_elems.push((tr, in_head, group));
+                        }
                     }
                     group += 1;
                 }
                 "tr" => {
                     in_implicit_group = true;
-                    row_elems.push((child, false, group));
+                    if !self.element_props(child).hidden {
+                        row_elems.push((child, false, group));
+                    }
                 }
                 _ => {}
             }
@@ -711,6 +806,9 @@ impl Builder<'_> {
             let mut any_cell = false;
             for cell in tr.child_elems() {
                 if !matches!(cell.local.as_str(), "td" | "th") {
+                    continue;
+                }
+                if self.element_props(cell).hidden {
                     continue;
                 }
                 any_cell = true;
@@ -830,6 +928,17 @@ fn is_block_tag(name: &str) -> bool {
 
 fn has_block_children(elem: &Element) -> bool {
     elem.child_elems().any(|e| is_block_tag(&e.local))
+}
+
+/// Whether an `<li>` had any content at all in the source (a child element,
+/// or non-whitespace text) - distinguishes "ended up empty because its only
+/// content was hidden" from a source `<li></li>` that was always empty, so
+/// [`Builder::parse_list`] drops only the former as a bare marker.
+fn li_had_content(li: &Element) -> bool {
+    li.children.iter().any(|n| match n {
+        Node::Text(t) => !t.trim().is_empty(),
+        Node::Elem(_) => true,
+    })
 }
 
 #[cfg(test)]
@@ -1069,5 +1178,125 @@ mod tests {
         let out = blocks("<body><details><summary>s</summary><p>x</p></details></body>");
         let text: String = out.iter().map(para_text).collect::<Vec<_>>().join(" ");
         assert!(text.contains('x'), "{out:?}");
+    }
+
+    #[test]
+    fn hiding_properties_do_not_cancel_each_other() {
+        // Each of the four CSS hiding triggers is independent: a later or
+        // higher-priority declaration of a *different* property must not
+        // resurrect content another property hid on the same element.
+        let out = blocks(r#"<body><p style="font-size:0; display:inline">x</p></body>"#);
+        assert!(out.is_empty(), "font-size:0 must survive display:inline: {out:?}");
+
+        let out = blocks(r#"<body><p style="opacity:0; display:block">x</p></body>"#);
+        assert!(out.is_empty(), "opacity:0 must survive display:block: {out:?}");
+
+        let css = "p.h { display: none }";
+        let out =
+            blocks_with_css(r#"<body><p class="h" style="visibility: visible">x</p></body>"#, css);
+        assert!(
+            out.is_empty(),
+            "display:none from a rule must survive visibility:visible: {out:?}"
+        );
+
+        // But a property's own opposite value, on the same element, still
+        // cancels its own hide.
+        let out = blocks(r#"<body><p style="opacity:0; opacity:0.5">x</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "x");
+    }
+
+    #[test]
+    fn aria_hidden_true_is_case_insensitive() {
+        let out = blocks(r#"<body><p aria-hidden="TRUE">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+
+        let out = blocks(r#"<body><p aria-hidden=" True ">x</p><p>y</p></body>"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(para_text(&out[0]), "y");
+    }
+
+    #[test]
+    fn hidden_body_yields_no_blocks() {
+        let out = blocks(r#"<body hidden=""><p>x</p></body>"#);
+        assert!(out.is_empty(), "{out:?}");
+
+        let out = blocks(r#"<body style="display: none"><p>x</p></body>"#);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidden_list_item_is_dropped() {
+        let out = blocks(
+            r#"<body><ul>
+                <li>one</li>
+                <li hidden="">two</li>
+                <li style="display: none">three</li>
+                <li>four</li>
+            </ul></body>"#,
+        );
+        let Block::List(list) = &out[0] else { panic!("{out:?}") };
+        let texts: Vec<String> = list.items.iter().map(|it| block_text(&it.blocks[0])).collect();
+        assert_eq!(texts, vec!["one".to_string(), "four".to_string()]);
+    }
+
+    #[test]
+    fn list_item_emptied_entirely_by_hidden_content_is_dropped() {
+        // The bullet itself is not hidden, but its only content is -
+        // leaving no blocks. It must not survive as a bare marker; a
+        // genuinely empty `<li></li>` is a separate, unaffected case.
+        let out = blocks(
+            r#"<body><ul>
+                <li>one</li>
+                <li><p hidden="">gone</p></li>
+                <li>three</li>
+                <li></li>
+            </ul></body>"#,
+        );
+        let Block::List(list) = &out[0] else { panic!("{out:?}") };
+        assert_eq!(list.items.len(), 3, "{list:?}");
+        assert_eq!(block_text(&list.items[0].blocks[0]), "one");
+        assert_eq!(block_text(&list.items[1].blocks[0]), "three");
+        assert!(list.items[2].blocks.is_empty(), "source-empty <li> stays, empty: {list:?}");
+    }
+
+    #[test]
+    fn hidden_table_row_is_dropped() {
+        let html = r#"<body><table>
+            <tr><th>keep</th></tr>
+            <tr hidden=""><th>gone</th></tr>
+            <tr style="display: none"><td>also gone</td></tr>
+            <tr><td>x</td></tr>
+        </table></body>"#;
+        let out = blocks(html);
+        let Block::Table(t) = &out[0] else { panic!("{out:?}") };
+        assert_eq!(t.grid.len(), 2, "hidden rows must not be counted: {t:?}");
+        assert_eq!(t.header_rows, 1, "a hidden row must not be treated as a header row");
+    }
+
+    #[test]
+    fn hidden_table_cell_is_dropped() {
+        let html = r#"<body><table>
+            <tr><td>a</td><td hidden="">b</td></tr>
+        </table></body>"#;
+        let out = blocks(html);
+        let Block::Table(t) = &out[0] else { panic!("{out:?}") };
+        // Only the visible cell should occupy the grid.
+        assert_eq!(t.grid[0].len(), 1, "{t:?}");
+    }
+
+    #[test]
+    fn hidden_table_row_group_drops_all_its_rows() {
+        let html = r#"<body><table>
+            <tbody hidden="">
+                <tr><td>gone1</td></tr>
+                <tr><td>gone2</td></tr>
+            </tbody>
+            <tbody><tr><td>kept</td></tr></tbody>
+        </table></body>"#;
+        let out = blocks(html);
+        let Block::Table(t) = &out[0] else { panic!("{out:?}") };
+        assert_eq!(t.grid.len(), 1, "{t:?}");
     }
 }

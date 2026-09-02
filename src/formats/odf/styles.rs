@@ -4,6 +4,11 @@
 //!
 //! Chains are keyed by owned `family\0name` strings because definitions come
 //! from two separately parsed trees (`styles.xml` and `content.xml`).
+//!
+//! `text:display` on `style:text-properties` carries through the chain as
+//! [`StyleDelta::hidden`] the same way as bold/italic/strike: `"none"`
+//! resolves hidden, `"condition"` and everything else (including the
+//! default `"true"`) resolves visible - see [`text_properties_delta`].
 
 use crate::error::ConvertError;
 use crate::package::xml::{Element, ns};

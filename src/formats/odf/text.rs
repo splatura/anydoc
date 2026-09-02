@@ -4,8 +4,14 @@
 //! `style:text-properties`, resolved through the style chain the same way
 //! as bold/italic/strike) is dropped, with no option to keep it: a hidden
 //! paragraph contributes nothing at all, and a hidden `text:span` drops
-//! only its own subtree. `text:display="condition"` is treated as visible
-//! (the field's live condition is not evaluated).
+//! only its own subtree. A `<text:section>` with `text:display="none"`
+//! (Writer's "Insert Section > Hide") is checked directly on the element
+//! itself - a section carries the attribute, not a style - and drops the
+//! whole section. `text:display="condition"` is treated as visible in both
+//! cases (the field's live condition is not evaluated). A list item left
+//! with no blocks after its content was dropped this way is itself dropped
+//! rather than kept as an empty marker (see [`parse_list`]); a source list
+//! item that was always empty is unaffected.
 
 use crate::error::ConvertError;
 use crate::formats::odf::styles::{LIST_LEVELS, OdfStyles, parse_start};
@@ -129,7 +135,20 @@ fn parse_block_elem(
                 blocks.extend(parse_list(elem, ctx, 0, None, &[])?);
                 return Ok(());
             }
-            "section" | "index-body" | "index-title" => {
+            "section" => {
+                // A section's own `text:display="none"` (Writer's "Insert
+                // Section > Hide") is a direct attribute, not a style
+                // property - checked the same way as `text-properties`:
+                // "condition" (a live `text:condition` this converter does
+                // not evaluate) resolves visible, same as any value other
+                // than the literal "none".
+                if elem.attr(ns::TEXT, "display") == Some("none") {
+                    return Ok(());
+                }
+                blocks.extend(parse_container(elem, ctx)?);
+                return Ok(());
+            }
+            "index-body" | "index-title" => {
                 blocks.extend(parse_container(elem, ctx)?);
                 return Ok(());
             }
@@ -232,7 +251,14 @@ fn parse_list(
         }
         first_item = false;
         let label = item_label(ctx, style_name, depth, &chain);
-        current.items.push(ListItem { blocks: item_blocks, marker_label: label });
+        // A list item left with no blocks because its only content was
+        // author-hidden (e.g. a single `text:display="none"` paragraph) is
+        // dropped rather than kept as a bare marker; an item that was
+        // always empty in the source is unaffected (`list_item_had_content`
+        // is false for it).
+        if !(item_blocks.is_empty() && list_item_had_content(item)) {
+            current.items.push(ListItem { blocks: item_blocks, marker_label: label });
+        }
         next = current.start.saturating_add(current.items.len() as u64);
     }
     flush(&mut current, &mut out, next);
@@ -243,6 +269,14 @@ fn parse_list(
         }
     }
     Ok(out)
+}
+
+/// Whether a `text:list-item`/`text:list-header` had any child element in
+/// the source - distinguishes "ended up empty because its only content was
+/// author-hidden" from an item that was always empty, so [`parse_list`]
+/// drops only the former as a bare marker.
+fn list_item_had_content(item: &Element) -> bool {
+    item.child_elems().next().is_some()
 }
 
 /// A list item's composite marker label (`num-prefix`/`num-suffix`/
