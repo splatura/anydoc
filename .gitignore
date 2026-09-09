@@ -16,3 +16,5 @@ __pycache__/
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+# Release archives from scripts/package-windows.ps1 and maturin's `--out dist`
+/dist/
